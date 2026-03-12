@@ -6,36 +6,17 @@ import {
 
 const API_BASE = process.env.POLYWEATHER_API_BASE_URL;
 
-export async function GET(
-  req: NextRequest,
-  context: { params: Promise<{ name: string }> },
-) {
+export async function GET(req: NextRequest) {
   if (!API_BASE) {
-    const response = NextResponse.json(
+    return NextResponse.json(
       { error: "POLYWEATHER_API_BASE_URL is not configured" },
       { status: 500 },
     );
-    return response;
   }
-
-  const { name } = await context.params;
-  const forceRefresh = req.nextUrl.searchParams.get("force_refresh") ?? "false";
-  const marketSlug = req.nextUrl.searchParams.get("market_slug");
-  const targetDate = req.nextUrl.searchParams.get("target_date");
-  const searchParams = new URLSearchParams({
-    force_refresh: forceRefresh,
-  });
-  if (marketSlug) {
-    searchParams.set("market_slug", marketSlug);
-  }
-  if (targetDate) {
-    searchParams.set("target_date", targetDate);
-  }
-  const url = `${API_BASE}/api/city/${encodeURIComponent(name)}/detail?${searchParams.toString()}`;
 
   try {
     const auth = await buildBackendRequestHeaders(req);
-    const res = await fetch(url, {
+    const res = await fetch(`${API_BASE}/api/auth/me`, {
       headers: auth.headers,
       cache: "no-store",
     });
@@ -51,10 +32,10 @@ export async function GET(
     const response = NextResponse.json(data);
     return applyAuthResponseCookies(response, auth.response);
   } catch (error) {
-    const response = NextResponse.json(
-      { error: "Failed to fetch city detail aggregate", detail: String(error) },
+    return NextResponse.json(
+      { error: "Failed to fetch auth profile", detail: String(error) },
       { status: 500 },
     );
-    return response;
   }
 }
+
