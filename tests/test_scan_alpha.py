@@ -307,6 +307,53 @@ class TestCooldown:
 # Config constants sanity
 # ===================================================================
 
+class TestKellySizing:
+    """kelly_size_pct — fractional Kelly position sizing."""
+
+    kelly_fn = staticmethod(scan_alpha.kelly_size_pct)
+
+    def test_miami_speed_alpha(self):
+        """Miami Apr 17: post-peak confirmed, market 40%. Capped at 10%."""
+        pct, full, label = self.kelly_fn("post_peak", True, 0.65, 0.40)
+        assert full == pytest.approx(79.2, abs=0.5)  # (0.875 - 0.40) / 0.60
+        # Quarter-Kelly would be 19.8%, but hard cap at 10%
+        assert pct == scan_alpha.KELLY_MAX_PCT
+        assert "speed-alpha" in label
+
+    def test_golden_hour_uses_empirical_rate(self):
+        """Golden hour: uses 36.4% win rate, not model probability."""
+        pct, full, label = self.kelly_fn("golden_hour", False, 0.58, 0.13)
+        # Kelly with q=0.364, p=0.13: (0.364-0.13)/(1-0.13) = 26.9%
+        assert full == pytest.approx(26.9, abs=0.5)
+        assert "golden-hour" in label
+
+    def test_no_edge_returns_zero(self):
+        """Market price above empirical win rate -> no bet."""
+        pct, full, label = self.kelly_fn("golden_hour", False, 0.70, 0.50)
+        # q=0.364 < p=0.50 -> no edge
+        assert pct == 0.0
+        assert "no edge" in label
+
+    def test_extreme_price_skip(self):
+        """Market at 99.7% -> skip, even if model says 100%."""
+        pct, _, label = self.kelly_fn("post_peak", True, 1.0, 0.997)
+        assert pct == 0.0
+        assert "extreme" in label
+
+    def test_hard_cap(self):
+        """Size must never exceed KELLY_MAX_PCT (10%)."""
+        pct, full, _ = self.kelly_fn("post_peak", True, 0.875, 0.05)
+        assert full > 80
+        assert pct <= scan_alpha.KELLY_MAX_PCT
+
+    def test_post_peak_non_speed_alpha(self):
+        """Post-peak but NOT speed-alpha (bucket unconfirmed)."""
+        pct, full, label = self.kelly_fn("post_peak", False, 0.80, 0.50)
+        # Uses KELLY_Q_POST_PEAK = 0.919: (0.919-0.50)/0.50 = 83.8%
+        assert full == pytest.approx(83.8, abs=0.5)
+        assert "post-peak" in label
+
+
 class TestConfigConstants:
     """Sanity check that the speed-alpha thresholds match the report."""
 

@@ -95,6 +95,14 @@ SPEED_ALPHA_MKT_MAX = 0.70   # above 70% = market already priced in, no alpha
 SPEED_ALPHA_SIGMA_MAX = 1.5  # model must have converged
 SPEED_ALPHA_LIQ_MIN = 200    # minimum liquidity for execution (keep permissive for now)
 
+# Kelly criterion position sizing
+# Empirical win rates from Apr 15-17 backtest (docs/TRADE_ACCURACY_REPORT.md)
+KELLY_Q_SPEED_ALPHA = 0.875   # 14/16 post-peak, market 5-70%, bucket confirmed
+KELLY_Q_POST_PEAK = 0.919     # 34/37 all post-peak HIGH conf
+KELLY_Q_GOLDEN_HOUR = 0.364   # 4/11 golden-hour HIGH conf
+KELLY_FRACTION = 0.25         # quarter-Kelly (conservative, small sample)
+KELLY_MAX_PCT = 10.0          # hard cap: never exceed 10% of bankroll
+
 # Tracks recently pushed signals to avoid spamming (separate per channel)
 _signal_cooldown: dict[str, float] = {}        # legacy channel
 _postpeak_cooldown: dict[str, float] = {}      # @postpeak channel
@@ -369,6 +377,44 @@ def is_speed_alpha_trade(decision: dict) -> bool:
         return False
 
     return True
+
+
+def kelly_size_pct(entry_mode: str, is_speed_alpha: bool,
+                   model_prob: float, market_price: float) -> tuple[float, float, str]:
+    """
+    Compute position size as % of bankroll using fractional Kelly criterion.
+
+    Returns (size_pct, full_kelly_pct, probability_source_label).
+
+    Kelly formula for binary YES bet at price p with win probability q:
+        f* = (q - p) / (1 - p)
+
+    We use empirical win rates (not model probability) as the probability
+    estimate, because the backtest showed model probability is miscalibrated
+    (positive-edge trades won only 44% with first-signal, model overestimates).
+    """
+    if market_price <= 0.01 or market_price >= 0.99:
+        return 0.0, 0.0, "skip (extreme price)"
+
+    # Select probability based on signal type
+    if is_speed_alpha:
+        q = KELLY_Q_SPEED_ALPHA
+        label = f"speed-alpha empirical ({q:.1%})"
+    elif entry_mode == "post_peak":
+        q = KELLY_Q_POST_PEAK
+        label = f"post-peak empirical ({q:.1%})"
+    else:
+        q = KELLY_Q_GOLDEN_HOUR
+        label = f"golden-hour empirical ({q:.1%})"
+
+    if q <= market_price:
+        return 0.0, 0.0, f"{label} — no edge (q <= p)"
+
+    full_kelly = (q - market_price) / (1.0 - market_price)
+    sized = full_kelly * KELLY_FRACTION * 100.0  # convert to % of bankroll
+    sized = min(sized, KELLY_MAX_PCT)             # hard cap
+
+    return sized, full_kelly * 100.0, label
 
 
 def _hours_until_peak(local_time_str: str, peak_hours: list) -> float | None:
@@ -823,7 +869,7 @@ def _format_telegram_message(decisions: list, bankroll: float) -> str:
         lines.append(f"   Bucket: {llm.get('bucket')}deg")
         lines.append(f"   Model: {mp:.1%} vs Market: {mkp:.1%}")
         lines.append(f"   Edge: {ep_str}")
-        lines.append(f"   Size: ${size_usd:.0f} ({size_pct:.1f}% of ${bankroll:.0f})")
+        lines.append(f"   Size: ${size_usd:.0f} ({size_pct:.1f}% of ${bankroll:.0f}) [1/4 Kelly]")
         lines.append(f"   Timing: {llm.get('time_sensitivity', '?')}")
         lines.append(f"   Reason: {llm.get('reasoning', '?')}")
         risks = llm.get("risk_factors", [])
@@ -1158,13 +1204,24 @@ def scan(*, dry_run: bool = False, bankroll: float = DEFAULT_BANKROLL, wave: str
         for d in buys:
             llm = d["llm"]
             ms = d["market_scan"]
-            size_pct = llm.get("size_pct_of_bankroll") or 0
-            size_usd = bankroll * (size_pct / 100.0)
             mp = llm.get("model_probability") or 0
             mkp = llm.get("estimated_market_price") or 0
             ep = llm.get("edge_pct")
             ep_str = f"{ep:+.1f}%" if isinstance(ep, (int, float)) else str(ep)
+
+            # Kelly sizing overrides LLM size
+            d["max_so_far"] = d.get("detail", {}).get("current", {}).get("max_so_far")
+            sa = is_speed_alpha_trade(d)
+            size_pct, full_kelly, q_label = kelly_size_pct(
+                d.get("entry_mode", ""), sa, mp, mkp)
+            size_usd = bankroll * (size_pct / 100.0)
+            odds = (1.0 - mkp) / mkp if 0.01 < mkp < 0.99 else 0
+
+            # Store Kelly size back into the decision for Telegram formatting
+            llm["size_pct_of_bankroll"] = size_pct
+
             print(f"  {d['city']:<14} bucket={llm.get('bucket')}  model={mp:.1%}  mkt={mkp:.1%}  edge={ep_str}  size=${size_usd:.0f}  [{llm.get('confidence')}]")
+            print(f"    Kelly: q={q_label}  odds={odds:.1f}:1  full={full_kelly:.1f}%  1/4K={size_pct:.1f}%  ${size_usd:.0f}")
             print(f"    {llm.get('reasoning', '')}")
 
             # Log to trades.csv for P&L backtesting
