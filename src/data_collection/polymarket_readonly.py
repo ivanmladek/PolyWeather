@@ -510,12 +510,14 @@ class PolymarketReadOnlyLayer:
                     else ""
                 )
             )
-            scan["primary_market"] = primary_market_payload
-            scan["selected_condition_id"] = condition_id
-            scan["selected_slug"] = market_slug
-            scan["liquidity"] = liquidity
-            scan["volume"] = volume
-            return scan
+            # Don't return early — continue to fetch prices so the UI and
+            # analytics scripts can still see market_price and top_buckets.
+
+        scan["primary_market"] = primary_market_payload
+        scan["selected_condition_id"] = condition_id
+        scan["selected_slug"] = market_slug
+        scan["liquidity"] = liquidity
+        scan["volume"] = volume
 
         tokens = self._extract_market_tokens(market)
         yes_token, no_token = self._resolve_yes_no_tokens(tokens)
@@ -599,8 +601,7 @@ class PolymarketReadOnlyLayer:
         market_url = self._build_market_url(market)
         scan.update(
             {
-                "available": True,
-                "reason": None,
+                "available": bool(trade_state.get("tradable")),
                 "primary_market": primary_market_payload,
                 "selected_condition_id": condition_id,
                 "selected_slug": market_slug,
@@ -1364,8 +1365,7 @@ class PolymarketReadOnlyLayer:
             ]
         ] = []
         for market in candidate_markets:
-            if not self._market_trade_state(market).get("tradable"):
-                continue
+            # Don't skip non-tradable markets — still fetch prices for analytics
             bucket_temp = self._extract_market_bucket_temp(market)
             if bucket_temp is None:
                 continue

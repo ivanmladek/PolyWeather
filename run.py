@@ -5,19 +5,19 @@ from loguru import logger
 
 
 def main():
-    logger.info("🌡️ PolyWeather 天气查询机器人启动中...")
+    logger.info("🌡️ PolyWeather weather query bot starting...")
 
-    # 创建数据目录
+    # Create data directory
     os.makedirs("data", exist_ok=True)
 
-    # 直接运行 bot_listener
+    # Run bot_listener directly
     cmd = [sys.executable, "bot_listener.py"]
-    logger.success("🚀 已上线！等待 Telegram 指令...")
+    logger.success("🚀 Online! Awaiting Telegram commands...")
 
     try:
         subprocess.run(cmd, cwd=os.getcwd())
     except KeyboardInterrupt:
-        logger.warning("停止运行...")
+        logger.warning("Stopping...")
 
 
 if __name__ == "__main__":

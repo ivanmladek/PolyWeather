@@ -77,46 +77,46 @@ def validate_runtime_env(
     if component_key == "bot":
         missing = _missing(["TELEGRAM_BOT_TOKEN"])
         if missing:
-            report.errors.append(f"Bot 启动缺少必填变量: {', '.join(missing)}")
+            report.errors.append(f"Bot startup missing required env vars: {', '.join(missing)}")
         if not (_has("TELEGRAM_CHAT_ID") or _has("TELEGRAM_CHAT_IDS")):
-            report.warnings.append("未配置 TELEGRAM_CHAT_ID / TELEGRAM_CHAT_IDS，机器人推送目标为空")
+            report.warnings.append("TELEGRAM_CHAT_ID / TELEGRAM_CHAT_IDS not configured — bot push target is empty")
 
     if auth_enabled:
         missing = _missing(["SUPABASE_URL", "SUPABASE_ANON_KEY"])
         if missing:
-            report.errors.append(f"已启用鉴权，但缺少变量: {', '.join(missing)}")
+            report.errors.append(f"Auth enabled but missing env vars: {', '.join(missing)}")
         if auth_required or auth_require_subscription or weekly_reward_enabled:
             missing = _missing(["SUPABASE_SERVICE_ROLE_KEY"])
             if missing:
-                report.errors.append(f"当前鉴权/订阅能力需要变量: {', '.join(missing)}")
+                report.errors.append(f"Auth/subscription features require env vars: {', '.join(missing)}")
 
     if entitlement_guard:
         missing = _missing(["POLYWEATHER_BACKEND_ENTITLEMENT_TOKEN"])
         if missing:
-            report.errors.append(f"已启用 backend entitlement guard，但缺少变量: {', '.join(missing)}")
+            report.errors.append(f"Backend entitlement guard enabled but missing env vars: {', '.join(missing)}")
 
     if payment_enabled:
         payment_missing = _missing(["POLYWEATHER_PAYMENT_RPC_URL"])
         if payment_missing:
-            report.errors.append(f"已启用支付，但缺少变量: {', '.join(payment_missing)}")
+            report.errors.append(f"Payment enabled but missing env vars: {', '.join(payment_missing)}")
         has_receiver = _has("POLYWEATHER_PAYMENT_RECEIVER_CONTRACT")
         has_tokens_json = _has("POLYWEATHER_PAYMENT_ACCEPTED_TOKENS_JSON")
         if not (has_receiver or has_tokens_json):
             report.errors.append(
-                "已启用支付，但未配置 POLYWEATHER_PAYMENT_RECEIVER_CONTRACT 或 POLYWEATHER_PAYMENT_ACCEPTED_TOKENS_JSON"
+                "Payment enabled but POLYWEATHER_PAYMENT_RECEIVER_CONTRACT or POLYWEATHER_PAYMENT_ACCEPTED_TOKENS_JSON not configured"
             )
 
     if wallet_activity_enabled:
         if not _has("POLYMARKET_WALLET_ACTIVITY_USERS"):
-            report.warnings.append("已启用 wallet activity watcher，但未配置 POLYMARKET_WALLET_ACTIVITY_USERS")
+            report.warnings.append("Wallet activity watcher enabled but POLYMARKET_WALLET_ACTIVITY_USERS not configured")
 
     if polygon_watch_enabled:
         if not _has("POLYGON_WALLET_WATCH_ADDRESSES"):
-            report.warnings.append("已启用 polygon watcher，但未配置 POLYGON_WALLET_WATCH_ADDRESSES")
+            report.warnings.append("Polygon watcher enabled but POLYGON_WALLET_WATCH_ADDRESSES not configured")
 
     if component_key == "web":
         if auth_enabled and not auth_required:
-            report.warnings.append("当前 Web 鉴权为 optional 模式，未强制登录")
+            report.warnings.append("Web auth is in optional mode — login not enforced")
 
     return report
 

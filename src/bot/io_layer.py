@@ -161,12 +161,12 @@ class BotIOLayer:
         self.send_query_message(
             message,
             (
-                f"❌ 积分不足，无法执行 <b>{label}</b>\n"
-                f"当前积分: <code>{balance}</code>\n"
-                f"需要积分: <code>{required}</code>\n"
-                f"还差积分: <code>{missing}</code>\n\n"
-                f"积分规则：有效发言满 {MESSAGE_MIN_LENGTH} 字获得 <b>{MESSAGE_POINTS}</b> 积分，"
-                f"每日上限 {MESSAGE_DAILY_CAP} 分。"
+                f"❌ Insufficient points for <b>{label}</b>\n"
+                f"Current points: <code>{balance}</code>\n"
+                f"Required: <code>{required}</code>\n"
+                f"Shortfall: <code>{missing}</code>\n\n"
+                f"Points rule: valid messages of {MESSAGE_MIN_LENGTH}+ chars earn <b>{MESSAGE_POINTS}</b> points, "
+                f"daily cap {MESSAGE_DAILY_CAP}."
             ),
             parse_mode="HTML",
         )
@@ -174,23 +174,23 @@ class BotIOLayer:
 
     def build_welcome_text(self) -> str:
         return (
-            "🚀 <b>PolyWeather 天气查询机器人</b>\n\n"
-            "可用指令:\n"
-            f"/city [城市名] 或 /pwcity [城市名] - 查询城市天气预测与实测 (消耗 {CITY_QUERY_COST} 积分)\n"
-            f"/deb [城市名] 或 /pwdeb [城市名] - 查看 DEB 融合预测准确率 (消耗 {DEB_QUERY_COST} 积分)\n"
-            "/markets - 私聊机器人查看当前市场监控摘要\n"
-            "/top - 查看积分排行榜\n"
-            "/id - 获取当前聊天的 Chat ID\n\n"
-            "/diag - 查看 Bot 启动诊断\n\n"
-            "/bind - 绑定 Supabase 账号（可选）\n"
-            "/unbind - 解除当前 Telegram 与网页账号绑定\n\n"
-            "🔗 机器人: <a href=\"https://t.me/WeatherQuant_bot\">@WeatherQuant_bot</a>\n"
-            "👥 社群: <a href=\"https://t.me/+nMG7SjziUKYyZmM1\">加入 Telegram 群组</a>\n\n"
-            "📌 <i>私有频道用于接收自动推送；手动查看市场概览请私聊机器人发送 <code>/markets</code>。</i>\n\n"
-            "🔐 <i>/city 与 /deb 仅限官方群成员使用。</i>\n\n"
-            "示例: <code>/city 伦敦</code> 或 <code>/pwcity 伦敦</code>\n"
-            f"💡 <i>提示: 每日签到(有效发言满 {MESSAGE_MIN_LENGTH} 字)获得 <b>{MESSAGE_POINTS}</b> 积分，"
-            f"每日上限 {MESSAGE_DAILY_CAP} 分。</i>"
+            "🚀 <b>PolyWeather Weather Query Bot</b>\n\n"
+            "Available commands:\n"
+            f"/city [city] or /pwcity [city] - Query city weather forecast & observations (costs {CITY_QUERY_COST} pts)\n"
+            f"/deb [city] or /pwdeb [city] - View DEB blended forecast accuracy (costs {DEB_QUERY_COST} pts)\n"
+            "/markets - View current market monitor digest (private chat only)\n"
+            "/top - View points leaderboard\n"
+            "/id - Get current chat ID\n\n"
+            "/diag - View bot startup diagnostics\n\n"
+            "/bind - Bind Supabase account (optional)\n"
+            "/unbind - Unbind Telegram from web account\n\n"
+            "🔗 Bot: <a href=\"https://t.me/WeatherQuant_bot\">@WeatherQuant_bot</a>\n"
+            "👥 Community: <a href=\"https://t.me/+nMG7SjziUKYyZmM1\">Join Telegram group</a>\n\n"
+            "📌 <i>Private channels receive automatic pushes; for manual market overview, send <code>/markets</code> to the bot in DM.</i>\n\n"
+            "🔐 <i>/city and /deb are restricted to official group members.</i>\n\n"
+            "Example: <code>/city london</code> or <code>/pwcity london</code>\n"
+            f"💡 <i>Tip: daily check-in (valid messages of {MESSAGE_MIN_LENGTH}+ chars) earns <b>{MESSAGE_POINTS}</b> points, "
+            f"daily cap {MESSAGE_DAILY_CAP}.</i>"
         )
 
     def build_points_rank_text(self, user: Any) -> str:
@@ -202,13 +202,13 @@ class BotIOLayer:
         week_key = str(weekly_profile.get("week_key") or "")
 
         leaderboard = self.db.get_weekly_leaderboard(limit=5)
-        rank_text = f"🏆 <b>PolyWeather 周活跃度排行榜 ({week_key})</b>\n"
+        rank_text = f"🏆 <b>PolyWeather Weekly Activity Leaderboard ({week_key})</b>\n"
         rank_text += "────────────────────\n"
         for i, entry in enumerate(leaderboard):
             medal = ["🥇", "🥈", "🥉", "  ", "  "][i] if i < 5 else "  "
             username = (entry.get("username") or "unknown")[:12]
             weekly_points = int(entry.get("weekly_points") or 0)
-            rank_text += f"{medal} {username}: <b>{weekly_points}</b> 点\n"
+            rank_text += f"{medal} {username}: <b>{weekly_points}</b> pts\n"
 
         if user_info:
             daily_points = int(user_info.get("daily_points") or 0)
@@ -222,18 +222,18 @@ class BotIOLayer:
             weekly_rank = weekly_profile.get("weekly_rank")
             ranked_count = int(weekly_profile.get("total_ranked") or 0)
             weekly_rank_text = (
-                f"{weekly_rank}/{ranked_count}" if weekly_rank and ranked_count > 0 else "未上榜"
+                f"{weekly_rank}/{ranked_count}" if weekly_rank and ranked_count > 0 else "Unranked"
             )
 
             rank_text += "────────────────────\n"
             rank_text += (
-                "👤 <b>我的状态：</b>\n"
-                f"┣ 累计积分: <code>{user_info['points']}</code>\n"
-                f"┣ 累计发言: <code>{user_info['message_count']}</code> 次\n"
-                f"┣ 本周排名: <code>{weekly_rank_text}</code>\n"
-                f"┣ 本周发言积分: <code>{weekly_points}</code>\n"
-                f"┣ 今日发言积分: <code>{daily_points}/{MESSAGE_DAILY_CAP}</code>\n"
-                f"┗ /city 消耗: <code>{CITY_QUERY_COST}</code> | /deb 消耗: <code>{DEB_QUERY_COST}</code>"
+                "👤 <b>My Status:</b>\n"
+                f"┣ Total points: <code>{user_info['points']}</code>\n"
+                f"┣ Total messages: <code>{user_info['message_count']}</code>\n"
+                f"┣ Weekly rank: <code>{weekly_rank_text}</code>\n"
+                f"┣ Weekly message pts: <code>{weekly_points}</code>\n"
+                f"┣ Today message pts: <code>{daily_points}/{MESSAGE_DAILY_CAP}</code>\n"
+                f"┗ /city cost: <code>{CITY_QUERY_COST}</code> | /deb cost: <code>{DEB_QUERY_COST}</code>"
             )
         return rank_text
 

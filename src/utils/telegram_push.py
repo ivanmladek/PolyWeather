@@ -310,11 +310,11 @@ def _format_interval_brief(seconds: int) -> str:
     total = max(1, int(seconds))
     if total % 3600 == 0:
         hours = total // 3600
-        return f"{hours}小时"
+        return f"{hours}h"
     if total % 60 == 0:
         minutes = total // 60
-        return f"{minutes}分钟"
-    return f"{total}秒"
+        return f"{minutes}min"
+    return f"{total}s"
 
 
 def _local_peak_context(alert_payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -340,16 +340,16 @@ def _local_peak_context(alert_payload: Dict[str, Any]) -> Dict[str, Any]:
     window_label = ""
     if 0 <= delta <= 120:
         score = 18.0
-        window_label = f"峰值前 {_format_minutes_window(delta)}"
+        window_label = f"{_format_minutes_window(delta)} before peak"
     elif 120 < delta <= 360:
         score = 10.0
-        window_label = f"距峰值 {_format_minutes_window(delta)}"
+        window_label = f"{_format_minutes_window(delta)} to peak"
     elif -90 <= delta < 0:
         score = 6.0
-        window_label = f"峰值后 {_format_minutes_window(delta)}"
+        window_label = f"{_format_minutes_window(delta)} after peak"
     elif delta < -90:
         score = -8.0
-        window_label = "峰值已过较久"
+        window_label = "well past peak"
 
     return {
         "local_time": generated_local_time,
@@ -410,18 +410,18 @@ def _market_monitor_score(alert_payload: Dict[str, Any]) -> float:
 
 def _priority_label(score: float) -> str:
     if score >= 72:
-        return "高优先级"
+        return "High Priority"
     if score >= 48:
-        return "重点观察"
-    return "继续观察"
+        return "Key Watch"
+    return "Monitor"
 
 
 def _join_trigger_types_cn_local(rules: Dict[str, Dict[str, Any]]) -> str:
     label_map = {
-        "ankara_center_deb_hit": "中心站触及 DEB",
-        "momentum_spike": "短时动量异动",
-        "forecast_breakthrough": "实测击穿模型",
-        "advection": "暖平流信号",
+        "ankara_center_deb_hit": "Center reached DEB",
+        "momentum_spike": "Momentum spike",
+        "forecast_breakthrough": "Obs exceeded model",
+        "advection": "Warm advection signal",
     }
     parts: List[str] = []
     for key, label in label_map.items():
@@ -434,8 +434,8 @@ def _join_trigger_types_cn_local(rules: Dict[str, Dict[str, Any]]) -> str:
 def _focus_trigger_summary(alert_payload: Dict[str, Any]) -> str:
     rules = alert_payload.get("rules") or {}
     if not isinstance(rules, dict):
-        return "市场与天气分歧待观察"
-    return _join_trigger_types_cn_local(rules) or "市场与天气分歧待观察"
+        return "Market-weather divergence under observation"
+    return _join_trigger_types_cn_local(rules) or "Market-weather divergence under observation"
 
 
 def _shortlist_focus_payloads(
@@ -487,7 +487,7 @@ def _build_focus_digest_message(
         return ""
 
     lines = [
-        f"🌐 PolyWeather 市场监控 · {slot_label}",
+        f"🌐 PolyWeather Market Monitor · {slot_label}",
         "",
     ]
 
@@ -510,40 +510,40 @@ def _build_focus_digest_message(
 
         score = _market_monitor_score(payload)
         lines.append(f"{idx}. {city_name} | {_priority_label(score)}")
-        lines.append("   " + f"关注桶 {bucket}")
+        lines.append("   " + f"Focus bucket {bucket}")
         local_time = str(peak_context.get("local_time") or "").strip()
         peak_time = str(peak_context.get("peak_time") or "").strip()
         window_label = str(peak_context.get("window_label") or "").strip()
         if local_time or peak_time or window_label:
             context_parts: List[str] = []
             if local_time:
-                context_parts.append(f"当地 {local_time}")
+                context_parts.append(f"Local {local_time}")
             if peak_time:
-                context_parts.append(f"峰值参考 {peak_time}")
+                context_parts.append(f"Peak ref {peak_time}")
             if window_label:
                 context_parts.append(window_label)
             lines.append("   " + " | ".join(context_parts))
         if current_temp is not None or deb_prediction is not None:
             lines.append(
                 "   "
-                + (f"实测 {current_temp:.1f}°C" if current_temp is not None else "实测 --")
+                + (f"Obs {current_temp:.1f}°C" if current_temp is not None else "Obs --")
                 + " | "
                 + (
-                    f"DEB 预报 {deb_prediction:.1f}°C"
+                    f"DEB forecast {deb_prediction:.1f}°C"
                     if deb_prediction is not None
-                    else "DEB 预报 --"
+                    else "DEB forecast --"
                 )
             )
-        lines.append(f"   触发：{_focus_trigger_summary(payload)}")
+        lines.append(f"   Trigger: {_focus_trigger_summary(payload)}")
         if market_url:
-            lines.append(f"   链接：{market_url}")
+            lines.append(f"   Link: {market_url}")
         lines.append("")
 
     frequency_parts = [
-        f"后台扫描：约每{scan_interval}一次",
-        f"主动推送：约每{digest_interval}一次",
+        f"Background scan: ~every {scan_interval}",
+        f"Active push: ~every {digest_interval}",
     ]
-    lines.append("更新频率：" + "；".join(frequency_parts))
+    lines.append("Update frequency: " + "; ".join(frequency_parts))
     return "\n".join(lines).strip()
 
 
@@ -623,11 +623,11 @@ def _maybe_send_focus_digest(
     local_now = datetime.now().astimezone()
     hour = local_now.hour
     if 6 <= hour < 15:
-        slot_label = "白天关注"
+        slot_label = "Daytime Watch"
     elif 15 <= hour < 23:
-        slot_label = "今晚关注"
+        slot_label = "Evening Watch"
     else:
-        slot_label = "夜间关注"
+        slot_label = "Overnight Watch"
     message = _build_focus_digest_message(
         shortlisted,
         slot_label=slot_label,
@@ -677,7 +677,7 @@ def _maybe_send_focus_digest(
 def build_market_monitor_digest(
     config: Dict[str, Any],
     *,
-    slot_label: str = "当前概览",
+    slot_label: str = "Current Overview",
     top_n: Optional[int] = None,
     force_refresh: bool = False,
 ) -> str:
@@ -707,7 +707,7 @@ def build_market_monitor_digest(
         )
         _save_state(_state_file(), state)
         return message
-    return "ℹ️ 当前没有可用的市场监控摘要。"
+    return "ℹ️ No market monitor digest available at this time."
 
 
 def _severity_ok(alert_payload: Dict[str, Any], min_severity: str, min_trigger_count: int) -> bool:
@@ -1000,7 +1000,7 @@ def _maybe_send_alert(
         require_actionable_quote=mispricing_only,
     ):
         is_active = False
-    message = ((alert_payload.get("telegram") or {}).get("zh") or "").strip()
+    message = ((alert_payload.get("telegram") or {}).get("en") or "").strip()
 
     if not is_active or not message:
         if last_city.get("active"):

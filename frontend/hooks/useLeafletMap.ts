@@ -90,7 +90,8 @@ function createMarkerIcon(
   city: CityListItem,
   snapshot?: Pick<CityDetail, "current" | "temp_symbol"> | CitySummary,
 ) {
-  const riskClass = `risk-${city.risk_level}`;
+  const tier = city.deb_recent_tier ?? city.risk_level;
+  const riskClass = `risk-${tier}`;
   const label = city.display_name;
   const unit = city.temp_unit === "fahrenheit" ? "°F" : "°C";
   const shortName = label.length > 10 ? `${label.substring(0, 8)}...` : label;
@@ -121,7 +122,7 @@ function getMarkerSignature(
 ) {
   return [
     city.display_name,
-    city.risk_level,
+    city.deb_recent_tier ?? city.risk_level,
     city.temp_unit,
     city.lat,
     city.lon,

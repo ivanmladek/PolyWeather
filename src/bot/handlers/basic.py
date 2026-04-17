@@ -112,7 +112,7 @@ class BasicCommandHandler:
         try:
             self.bot.reply_to(
                 message,
-                f"🎯 当前聊天的 Chat ID 是: <code>{message.chat.id}</code>",
+                f"🎯 Chat ID for this conversation: <code>{message.chat.id}</code>",
                 parse_mode="HTML",
             )
             trace.set_status("ok")
@@ -145,9 +145,9 @@ class BasicCommandHandler:
                 self.bot.reply_to(
                     message,
                     (
-                        "❌ 用法:\n"
+                        "❌ Usage:\n"
                         "<code>/bind &lt;supabase_user_id&gt; [email]</code>\n\n"
-                        "示例:\n"
+                        "Example:\n"
                         "<code>/bind 11111111-2222-3333-4444-555555555555 user@example.com</code>"
                     ),
                     parse_mode="HTML",
@@ -157,7 +157,7 @@ class BasicCommandHandler:
 
             supabase_user_id = str(parts[1] or "").strip()
             if len(supabase_user_id) < 8:
-                self.bot.reply_to(message, "❌ supabase_user_id 格式不正确。")
+                self.bot.reply_to(message, "❌ Invalid supabase_user_id format.")
                 trace.set_status("bad_request", "invalid_supabase_user_id")
                 return
             supabase_email = str(parts[2] or "").strip() if len(parts) >= 3 else ""
@@ -175,9 +175,9 @@ class BasicCommandHandler:
                     self.bot.reply_to(
                         message,
                         (
-                            "❌ 当前 Telegram 已绑定其他网页账号。\n"
-                            f"当前绑定: <code>{current_uid}</code>\n\n"
-                            "请先执行 <code>/unbind</code> 再绑定新账号。"
+                            "❌ This Telegram account is already bound to another web account.\n"
+                            f"Current binding: <code>{current_uid}</code>\n\n"
+                            "Run <code>/unbind</code> first to bind a new account."
                         ),
                         parse_mode="HTML",
                     )
@@ -188,15 +188,15 @@ class BasicCommandHandler:
                     self.bot.reply_to(
                         message,
                         (
-                            "❌ 该网页账号已绑定到其他 Telegram。\n"
-                            f"绑定中的 Telegram ID: <code>{owner}</code>\n\n"
-                            "如需迁移，请先在原 Telegram 账号执行 <code>/unbind</code>。"
+                            "❌ This web account is already bound to another Telegram.\n"
+                            f"Bound Telegram ID: <code>{owner}</code>\n\n"
+                            "To migrate, run <code>/unbind</code> from the original Telegram account first."
                         ),
                         parse_mode="HTML",
                     )
                     trace.set_status("conflict", "supabase_already_bound_other")
                     return
-                self.bot.reply_to(message, "❌ 绑定失败，请稍后重试。")
+                self.bot.reply_to(message, "❌ Binding failed. Please try again later.")
                 trace.set_status("error", reason)
                 return
 
@@ -204,7 +204,7 @@ class BasicCommandHandler:
                 self.bot.reply_to(
                     message,
                     (
-                        "✅ 已是当前绑定账号，无需重复绑定。\n"
+                        "✅ Already bound to this account — no action needed.\n"
                         f"supabase_user_id: <code>{supabase_user_id}</code>"
                     ),
                     parse_mode="HTML",
@@ -215,7 +215,7 @@ class BasicCommandHandler:
             self.bot.reply_to(
                 message,
                 (
-                    "✅ 账号绑定完成。\n"
+                    "✅ Account binding complete.\n"
                     f"supabase_user_id: <code>{supabase_user_id}</code>"
                 ),
                 parse_mode="HTML",
@@ -233,13 +233,13 @@ class BasicCommandHandler:
             if str(result.get("reason") or "") == "not_bound":
                 self.bot.reply_to(
                     message,
-                    "ℹ️ 当前 Telegram 尚未绑定网页账号。",
+                    "ℹ️ This Telegram account is not bound to any web account.",
                 )
                 trace.set_status("ok", "not_bound")
                 return
             self.bot.reply_to(
                 message,
-                "✅ 已解除当前 Telegram 与网页账号的绑定。",
+                "✅ Telegram-to-web account binding has been removed.",
             )
             trace.set_status("ok", "unbound")
         finally:
@@ -252,7 +252,7 @@ class BasicCommandHandler:
             if chat_type and chat_type != "private":
                 self.bot.reply_to(
                     message,
-                    "ℹ️ `/markets` 仅支持私聊机器人查询。\n频道继续接收自动推送；如需手动查看当前市场概览，请私聊 bot 发送 `/markets`。",
+                    "ℹ️ `/markets` is only available via private chat.\nChannels continue to receive automatic pushes; to manually view the market overview, send `/markets` to the bot in a private message.",
                     parse_mode="Markdown",
                 )
                 trace.set_status("blocked", f"unsupported_chat_type:{chat_type}")
@@ -268,20 +268,20 @@ class BasicCommandHandler:
             if cached_summary:
                 self.bot.reply_to(message, cached_summary, disable_web_page_preview=True)
             else:
-                self.bot.reply_to(message, "⏳ 正在生成当前市场概览，请稍候...")
+                self.bot.reply_to(message, "⏳ Generating current market overview, please wait...")
 
             def _worker() -> None:
                 try:
                     summary = build_market_monitor_digest(
                         self.config,
-                        slot_label="当前市场概览",
+                        slot_label="Current Market Overview",
                         force_refresh=False,
                     )
                     if not cached_summary or summary.strip() != cached_summary.strip():
                         self.bot.send_message(chat_id, summary, disable_web_page_preview=True)
                 except Exception:
                     if not cached_summary:
-                        self.bot.send_message(chat_id, "❌ 当前市场概览生成失败，请稍后重试。")
+                        self.bot.send_message(chat_id, "❌ Failed to generate market overview. Please try again later.")
 
             threading.Thread(
                 target=_worker,

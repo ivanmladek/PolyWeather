@@ -170,7 +170,7 @@ class StartupCoordinator:
         validation_error = None if chat_ids else "missing_TELEGRAM_CHAT_IDS"
         return self._start_with_validation(
             key="trade_alert_push",
-            label="市场监控推送",
+            label="Market Monitor Push",
             configured_enabled=enabled,
             details=details,
             validation_error=validation_error,
@@ -199,7 +199,7 @@ class StartupCoordinator:
             validation_error = "missing_POLYWEATHER_BACKEND_ENTITLEMENT_TOKEN"
         return self._start_with_validation(
             key="dashboard_prewarm",
-            label="站点面板预热",
+            label="Dashboard Prewarm",
             configured_enabled=enabled,
             details=details,
             validation_error=validation_error,
@@ -227,7 +227,7 @@ class StartupCoordinator:
             validation_error = "missing_POLYGON_WALLET_WATCH_ADDRESSES"
         return self._start_with_validation(
             key="polygon_wallet_watch",
-            label="Polygon 钱包监听",
+            label="Polygon Wallet Watch",
             configured_enabled=enabled,
             details=details,
             validation_error=validation_error,
@@ -239,7 +239,7 @@ class StartupCoordinator:
     def _start_polymarket_wallet_activity_loop(self) -> LoopStatus:
         return LoopStatus(
             key="polymarket_wallet_activity",
-            label="Polymarket 钱包异动监听（已停用）",
+            label="Polymarket Wallet Activity Watch (retired)",
             configured_enabled=False,
             started=False,
             reason="retired_replaced_by_market_monitor",
@@ -278,7 +278,7 @@ class StartupCoordinator:
             validation_error = "missing_TELEGRAM_CHAT_IDS"
         return self._start_with_validation(
             key="weekly_reward",
-            label="周榜奖励结算",
+            label="Weekly Reward Settlement",
             configured_enabled=enabled,
             details=details,
             validation_error=validation_error,
@@ -305,7 +305,7 @@ class StartupCoordinator:
             validation_error = "payment_service_disabled"
         return self._start_with_validation(
             key="payment_confirm",
-            label="支付自动补单",
+            label="Payment Auto-Confirm",
             configured_enabled=enabled,
             details=details,
             validation_error=validation_error,
@@ -342,7 +342,7 @@ class StartupCoordinator:
             validation_error = "payment_service_disabled"
         return self._start_with_validation(
             key="payment_event",
-            label="支付事件监听",
+            label="Payment Event Watch",
             configured_enabled=enabled,
             details=details,
             validation_error=validation_error,
@@ -354,14 +354,14 @@ class StartupCoordinator:
 
 def render_runtime_status_html(status: RuntimeStatus) -> str:
     lines = [
-        "🧭 <b>Bot 启动诊断</b>",
-        f"启动时间: <code>{status.started_at}</code>",
+        "🧭 <b>Bot Startup Diagnostics</b>",
+        f"Started at: <code>{status.started_at}</code>",
         "",
-        f"命令准入: <code>{status.command_access_mode}</code>",
-        f"受保护命令: <code>{', '.join(status.protected_commands) or '--'}</code>",
-        f"目标群组: <code>{status.required_group_chat_id or '--'}</code>",
+        f"Command access: <code>{status.command_access_mode}</code>",
+        f"Protected commands: <code>{', '.join(status.protected_commands) or '--'}</code>",
+        f"Target group: <code>{status.required_group_chat_id or '--'}</code>",
         "",
-        "后台循环:",
+        "Background loops:",
     ]
     for loop in status.loops:
         icon = "✅" if loop.started else ("⏸" if not loop.configured_enabled else "⚠️")

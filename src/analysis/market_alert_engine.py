@@ -415,10 +415,10 @@ def _calc_peak_passed_guard(city_weather: Dict[str, Any], temp_symbol: str) -> D
 
 def _join_trigger_types_cn(rules: Dict[str, Dict[str, Any]]) -> str:
     mapping = [
-        ("ankara_center_deb_hit", "Center达到DEB"),
-        ("momentum_spike", "动量突变"),
-        ("forecast_breakthrough", "预测突破"),
-        ("advection", "暖平流"),
+        ("ankara_center_deb_hit", "Center reached DEB"),
+        ("momentum_spike", "Momentum spike"),
+        ("forecast_breakthrough", "Forecast breakthrough"),
+        ("advection", "Warm advection"),
     ]
     parts = [name for key, name in mapping if rules.get(key, {}).get("triggered")]
     return " + ".join(parts)
@@ -776,10 +776,10 @@ def _build_advice_cn(
         rollback = _sf((suppression or {}).get("rollback"))
         if max_so_far is not None and max_temp_time and rollback is not None:
             return (
-                f"当地高温大概率已在 {max_temp_time} 前后兑现，"
-                f"较日内高点 {max_so_far:.1f}{temp_symbol} 已回落 {rollback:.1f}{temp_symbol}，暂停主动推送。"
+                f"Local high likely realized around {max_temp_time}, "
+                f"down {rollback:.1f}{temp_symbol} from intraday high {max_so_far:.1f}{temp_symbol}. Active push paused."
             )
-        return "当地高温大概率已经兑现，当前进入回落阶段，暂停主动推送。"
+        return "Local high likely realized; now in cool-down phase. Active push paused."
 
     parts: List[str] = []
     center_deb = rules.get("ankara_center_deb_hit", {})
@@ -792,24 +792,24 @@ def _build_advice_cn(
         center_temp = _sf(((center_deb.get("center_station") or {}).get("temp")))
         if deb_prediction is not None and center_temp is not None:
             parts.append(
-                f"Ankara Center {center_temp:.1f}{temp_symbol} 已触及 DEB {deb_prediction:.1f}{temp_symbol}"
+                f"Ankara Center {center_temp:.1f}{temp_symbol} has reached DEB {deb_prediction:.1f}{temp_symbol}"
             )
         else:
-            parts.append("Ankara Center 已触及 DEB 预测值")
+            parts.append("Ankara Center has reached DEB forecast")
     if advection.get("triggered"):
-        parts.append("风向转南，暖平流增强")
+        parts.append("Wind shifted south, warm advection strengthening")
     if momentum.get("triggered"):
         d = _sf(momentum.get("slope_30m")) or 0.0
         if d > 0:
-            parts.append("短时升温斜率过快")
+            parts.append("Rapid short-term warming slope")
         else:
-            parts.append("短时降温斜率过快")
+            parts.append("Rapid short-term cooling slope")
     if breakthrough.get("triggered"):
-        parts.append("实测已击穿主流模型上沿")
+        parts.append("Observed temp has exceeded model upper bound")
 
     if not parts:
-        return "当前未触发高优先级关键信号，继续观察实测与模型联动。"
-    return "，".join(parts) + "。"
+        return "No high-priority triggers fired; continue monitoring obs vs model."
+    return "; ".join(parts) + "."
 
 
 def _classify_low_yes_signal(
@@ -839,27 +839,27 @@ def _classify_low_yes_signal(
         return {
             "label": "undervalued",
             "should_push": True,
-            "reason_cn": "该桶 Yes 价格 < 10c，且天气信号与上行方向一致，疑似低估",
+            "reason_cn": "Bucket Yes price < 10c with weather signals aligned bullish — possible undervaluation",
         }
 
     if cheap_yes and center_hit and bearish_conflict:
         return {
             "label": "conflicted",
             "should_push": False,
-            "reason_cn": "该桶 Yes 价格虽 < 10c，但短时动量转弱，暂不判定低估",
+            "reason_cn": "Bucket Yes price < 10c but short-term momentum weakening — not classified as undervalued",
         }
 
     if cheap_yes:
         return {
             "label": "watch",
             "should_push": False,
-            "reason_cn": "该桶 Yes 价格 < 10c，但方向确认不足，先观察",
+            "reason_cn": "Bucket Yes price < 10c but directional confirmation insufficient — watching",
         }
 
     return {
         "label": "none",
         "should_push": False,
-        "reason_cn": "当前未出现明确的低价错配信号",
+        "reason_cn": "No clear low-price mispricing signal detected",
     }
 
 
@@ -886,24 +886,24 @@ def _build_telegram_messages(
     suppressed = bool((suppression or {}).get("suppressed"))
     has_active_trigger = any(rule.get("triggered") for rule in rules.values())
     if suppressed:
-        types_cn = "高温已过（暂停推送）"
+        types_cn = "Peak passed (push paused)"
     else:
-        types_cn = _join_trigger_types_cn(rules) or "天气状态快照"
+        types_cn = _join_trigger_types_cn(rules) or "Weather snapshot"
     delta_temp = _sf(momentum.get("delta_temp"))
     delta_min = momentum.get("delta_minutes")
     center_station = center_deb.get("center_station") or {}
 
-    dyn = f"实测 {current_temp:.1f}{temp_symbol}"
+    dyn = f"Obs {current_temp:.1f}{temp_symbol}"
     if delta_temp is not None and delta_min is not None:
         icon = "🚀" if delta_temp > 0 else ("🧊" if delta_temp < 0 else "➖")
-        dyn += f" ({int(delta_min)}min 内 {delta_temp:+.1f}{temp_symbol}) {icon}"
+        dyn += f" ({delta_temp:+.1f}{temp_symbol} in {int(delta_min)}min) {icon}"
 
     lead_line = ""
     if advection.get("triggered"):
         st_name = ((advection.get("lead_station") or {}).get("name")) or "nearby station"
         lead_delta = _sf(advection.get("lead_delta"))
         if lead_delta is not None:
-            lead_line = f"联动：{st_name} 已领先 {lead_delta:+.1f}{temp_symbol}"
+            lead_line = f"Advection: {st_name} leads by {lead_delta:+.1f}{temp_symbol}"
 
     center_deb_line = ""
     if center_deb.get("triggered"):
@@ -914,12 +914,12 @@ def _build_telegram_messages(
         lead_gap = _sf(center_deb.get("center_lead_vs_airport"))
         if center_temp is not None and deb_prediction is not None:
             center_deb_line = (
-                f"Center信号：{center_name} {center_temp:.1f}{temp_symbol} 已达到 DEB {deb_prediction:.1f}{temp_symbol}"
+                f"Center signal: {center_name} {center_temp:.1f}{temp_symbol} reached DEB {deb_prediction:.1f}{temp_symbol}"
             )
             if airport_temp is not None:
-                center_deb_line += f" | 机场 {airport_temp:.1f}{temp_symbol}"
+                center_deb_line += f" | Airport {airport_temp:.1f}{temp_symbol}"
             if lead_gap is not None:
-                center_deb_line += f" | 领先 {lead_gap:+.1f}{temp_symbol}"
+                center_deb_line += f" | Leading by {lead_gap:+.1f}{temp_symbol}"
 
     peak_line = ""
     if suppressed:
@@ -928,28 +928,28 @@ def _build_telegram_messages(
         rollback = _sf((suppression or {}).get("rollback"))
         if max_so_far is not None and max_temp_time and rollback is not None:
             peak_line = (
-                f"高温状态：日内高点 {max_so_far:.1f}{temp_symbol} @ {max_temp_time}，"
-                f"当前已回落 {rollback:.1f}{temp_symbol}"
+                f"Peak state: intraday high {max_so_far:.1f}{temp_symbol} @ {max_temp_time}, "
+                f"now down {rollback:.1f}{temp_symbol}"
             )
 
     advice = _build_advice_cn(rules, temp_symbol, suppression=suppression)
     final_map = map_url or "https://polyweather-pro.vercel.app/"
-    title_zh = "🚨 PolyWeather 市场提醒" if has_active_trigger else "📍 PolyWeather 状态快照"
+    title_zh = "🚨 PolyWeather Market Alert" if has_active_trigger else "📍 PolyWeather Status"
     title_en = "🚨 PolyWeather Market Alert" if has_active_trigger else "📍 PolyWeather Status"
 
     lines_zh = [
         f"{title_zh} [{city_name}]",
         "",
-        f"类型：{types_cn}",
-        f"动态：{dyn}",
+        f"Type: {types_cn}",
+        f"Now: {dyn}",
     ]
     if local_time or obs_time:
         if local_time and obs_time:
-            lines_zh.append(f"时间：当地 {local_time} | 观测 {obs_time}")
+            lines_zh.append(f"Time: local {local_time} | observed {obs_time}")
         elif local_time:
-            lines_zh.append(f"时间：当地 {local_time}")
+            lines_zh.append(f"Time: local {local_time}")
         else:
-            lines_zh.append(f"时间：观测 {obs_time}")
+            lines_zh.append(f"Time: observed {obs_time}")
     if center_deb_line:
         lines_zh.append(center_deb_line)
     if peak_line:
@@ -957,7 +957,7 @@ def _build_telegram_messages(
     if lead_line:
         lines_zh.append(lead_line)
     if market_snapshot.get("available") and market_snapshot.get("top_bucket_rows"):
-        lines_zh.append("市场结算概率分布（Top4）：")
+        lines_zh.append("Settlement distribution (Top4):")
         for row in (market_snapshot.get("top_bucket_rows") or [])[:4]:
             label = row.get("label") or "--"
             prob_text = _fmt_percent(row.get("probability"))
@@ -967,23 +967,23 @@ def _build_telegram_messages(
         market_edge = _sf(market_snapshot.get("edge_percent"))
         market_edge_text = f"{market_edge:+.1f}%" if market_edge is not None else "--"
         lines_zh.append(
-            "市场联动：同桶 "
-            f"模型 {_fmt_percent(market_snapshot.get('model_prob'))} vs "
-            f"市场 {_fmt_percent(market_snapshot.get('market_prob'))} | "
+            "Market: same-bucket "
+            f"model {_fmt_percent(market_snapshot.get('model_prob'))} vs "
+            f"market {_fmt_percent(market_snapshot.get('market_prob'))} | "
             f"Yes {_fmt_cents(market_snapshot.get('yes_buy'))}/{_fmt_cents(market_snapshot.get('yes_sell'))} | "
-            f"点差 {_fmt_cents(market_snapshot.get('spread'))} | "
-            f"偏差 {market_edge_text} | "
-            f"信号 {market_snapshot.get('signal_label') or '--'}/{market_snapshot.get('confidence') or '--'}"
+            f"spread {_fmt_cents(market_snapshot.get('spread'))} | "
+            f"edge {market_edge_text} | "
+            f"signal {market_snapshot.get('signal_label') or '--'}/{market_snapshot.get('confidence') or '--'}"
         )
         if market_snapshot.get("top_bucket"):
             lines_zh.append(
-                f"市场最热桶：{market_snapshot.get('top_bucket')} "
+                f"Top bucket: {market_snapshot.get('top_bucket')} "
                 f"({_fmt_percent(market_snapshot.get('top_bucket_prob'))})"
             )
     if market_snapshot.get("market_url"):
-        lines_zh.append(f"市场链接：{market_snapshot.get('market_url')}")
-    lines_zh.append(f"AI 建议：{advice}")
-    lines_zh.append(f"点击查看实时地图：{final_map}")
+        lines_zh.append(f"Market link: {market_snapshot.get('market_url')}")
+    lines_zh.append(f"Action: {advice}")
+    lines_zh.append(f"Map: {final_map}")
 
     type_en = []
     if rules.get("ankara_center_deb_hit", {}).get("triggered"):
@@ -1079,7 +1079,7 @@ def _build_telegram_messages_mispricing(
     obs_time = str(current.get("obs_time") or "").strip()
     suppressed = bool((suppression or {}).get("suppressed"))
     has_active_trigger = any(rule.get("triggered") for rule in rules.values())
-    types_cn = "高温已过（暂停推送）" if suppressed else (_join_trigger_types_cn(rules) or "天气状态快照")
+    types_cn = "Peak passed (push paused)" if suppressed else (_join_trigger_types_cn(rules) or "Weather snapshot")
 
     delta_temp = _sf(momentum.get("delta_temp"))
     delta_min = momentum.get("delta_minutes")
@@ -1087,11 +1087,11 @@ def _build_telegram_messages_mispricing(
     if delta_temp is not None:
         momentum_emoji = "🚀" if delta_temp > 0 else ("📉" if delta_temp < 0 else "➡️")
 
-    dynamic_text = f"实测 {current_temp:.1f}{temp_symbol}"
+    dynamic_text = f"Obs {current_temp:.1f}{temp_symbol}"
     if delta_temp is not None and delta_min is not None:
         dynamic_text = (
-            f"实测 {current_temp:.1f}{temp_symbol} "
-            f"({int(delta_min)}min 内 {delta_temp:+.1f}{temp_symbol}) {momentum_emoji}"
+            f"Obs {current_temp:.1f}{temp_symbol} "
+            f"({delta_temp:+.1f}{temp_symbol} in {int(delta_min)}min) {momentum_emoji}"
         )
 
     anchor_high_c = _sf(snapshot.get("anchor_today_high_c"))
@@ -1127,52 +1127,52 @@ def _build_telegram_messages_mispricing(
         lead_gap = _sf(center_deb.get("center_lead_vs_airport"))
         if center_temp is not None and deb_prediction is not None:
             center_line = (
-                f"Center信号：{center_name} {center_temp:.1f}{temp_symbol} 已达到 DEB {deb_prediction:.1f}{temp_symbol}"
+                f"Center signal: {center_name} {center_temp:.1f}{temp_symbol} reached DEB {deb_prediction:.1f}{temp_symbol}"
             )
             if airport_temp is not None:
-                center_line += f" | 机场 {airport_temp:.1f}{temp_symbol}"
+                center_line += f" | Airport {airport_temp:.1f}{temp_symbol}"
             if lead_gap is not None:
-                center_line += f" | 领先 {lead_gap:+.1f}{temp_symbol}"
+                center_line += f" | Leading by {lead_gap:+.1f}{temp_symbol}"
 
     if snapshot.get("available") and signal_state.get("should_push"):
-        title_zh = "🚨 PolyWeather 市场监控"
+        title_zh = "🚨 PolyWeather Market Monitor"
     elif snapshot.get("available"):
-        title_zh = "📍 PolyWeather 市场观察"
+        title_zh = "📍 PolyWeather Market Watch"
     else:
-        title_zh = "🚨 PolyWeather 市场提醒" if (has_active_trigger or suppressed) else "📍 PolyWeather 状态快照"
+        title_zh = "🚨 PolyWeather Market Alert" if (has_active_trigger or suppressed) else "📍 PolyWeather Status"
 
     lines_zh = [f"{title_zh} [{city_name}]"]
     lines_zh.append("")
-    lines_zh.append(f"类型：{types_cn}")
+    lines_zh.append(f"Type: {types_cn}")
     if anchor_high_c is not None and anchor_settle is not None:
         if anchor_model:
             lines_zh.append(
-                f"基准：多模型最高温 {anchor_model} {anchor_high_c:.1f}°C （结算参考 {anchor_settle}°C ）"
+                f"Anchor: multi-model high {anchor_model} {anchor_high_c:.1f}°C (settlement ref {anchor_settle}°C)"
             )
         else:
             lines_zh.append(
-                f"基准：多模型最高温 {anchor_high_c:.1f}C（结算参考 {anchor_settle}C）"
+                f"Anchor: multi-model high {anchor_high_c:.1f}C (settlement ref {anchor_settle}C)"
             )
     else:
-        lines_zh.append("基准：多模型最高温 --（结算参考 --）")
-    lines_zh.append(f"命中桶：{match_bucket_label} | Yes: {match_bucket_yes}")
-    lines_zh.append(f"触发：{signal_state.get('reason_cn')}")
+        lines_zh.append("Anchor: multi-model high -- (settlement ref --)")
+    lines_zh.append(f"Matched bucket: {match_bucket_label} | Yes: {match_bucket_yes}")
+    lines_zh.append(f"Trigger: {signal_state.get('reason_cn')}")
     if center_line:
         lines_zh.append(center_line)
     lines_zh.append("")
-    lines_zh.append(f"动态：{dynamic_text}")
+    lines_zh.append(f"Now: {dynamic_text}")
     if local_time or obs_time:
         if local_time and obs_time:
-            lines_zh.append(f"时间：当地 {local_time} | 观测 {obs_time}")
+            lines_zh.append(f"Time: local {local_time} | observed {obs_time}")
         elif local_time:
-            lines_zh.append(f"时间：当地 {local_time}")
+            lines_zh.append(f"Time: local {local_time}")
         else:
-            lines_zh.append(f"时间：观测 {obs_time}")
-    lines_zh.append(f"建议：{advice}")
+            lines_zh.append(f"Time: observed {obs_time}")
+    lines_zh.append(f"Action: {advice}")
     lines_zh.append("")
     if market_url:
-        lines_zh.append(f"市场链接：{market_url}")
-    lines_zh.append(f"地图：{final_map}")
+        lines_zh.append(f"Market link: {market_url}")
+    lines_zh.append(f"Map: {final_map}")
 
     title_en = (
         "🚨 PolyWeather Market Monitor"

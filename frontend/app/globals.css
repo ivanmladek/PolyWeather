@@ -337,6 +337,13 @@
     border-top-color: #10b981;
   }
 
+  .marker-bubble.risk-other {
+    background: linear-gradient(135deg, #475569, #64748b);
+    border-color: rgba(100, 116, 139, 0.5);
+  }
+
+  .marker-bubble.risk-other::after { border-top-color: #64748b; }
+
   .marker-name {
     margin-top: var(--space-2);
     font-size: 10px;
