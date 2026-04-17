@@ -268,6 +268,8 @@ class TestPromptBuildingSafety:
 # ===================================================================
 
 class TestCooldown:
+    """Legacy and @postpeak cooldowns must be independent."""
+
     def test_not_on_cooldown_initially(self):
         assert scan_alpha._is_on_cooldown("TestCity", 79, "2026-04-15") is False
 
@@ -282,6 +284,23 @@ class TestCooldown:
     def test_different_date_not_on_cooldown(self):
         scan_alpha._mark_pushed("CooldownTest3", 80, "2026-04-15")
         assert scan_alpha._is_on_cooldown("CooldownTest3", 80, "2026-04-16") is False
+
+    def test_postpeak_cooldown_independent_of_legacy(self):
+        """Pushing to legacy must NOT block @postpeak, and vice versa."""
+        city, bucket, date = "IndependenceTest", 79, "2026-04-15"
+        # Mark legacy pushed
+        scan_alpha._mark_pushed(city, bucket, date)
+        # Postpeak should NOT be on cooldown
+        assert scan_alpha._is_postpeak_on_cooldown(city, bucket, date) is False
+
+        # Now mark postpeak pushed
+        scan_alpha._mark_postpeak_pushed(city, bucket, date)
+        assert scan_alpha._is_postpeak_on_cooldown(city, bucket, date) is True
+
+    def test_postpeak_cooldown_basic(self):
+        assert scan_alpha._is_postpeak_on_cooldown("PPTest", 33, "2026-04-17") is False
+        scan_alpha._mark_postpeak_pushed("PPTest", 33, "2026-04-17")
+        assert scan_alpha._is_postpeak_on_cooldown("PPTest", 33, "2026-04-17") is True
 
 
 # ===================================================================

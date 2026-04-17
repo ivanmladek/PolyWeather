@@ -95,8 +95,9 @@ SPEED_ALPHA_MKT_MAX = 0.70   # above 70% = market already priced in, no alpha
 SPEED_ALPHA_SIGMA_MAX = 1.5  # model must have converged
 SPEED_ALPHA_LIQ_MIN = 200    # minimum liquidity for execution (keep permissive for now)
 
-# Tracks recently pushed signals to avoid spamming
-_signal_cooldown: dict[str, float] = {}
+# Tracks recently pushed signals to avoid spamming (separate per channel)
+_signal_cooldown: dict[str, float] = {}        # legacy channel
+_postpeak_cooldown: dict[str, float] = {}      # @postpeak channel
 
 # ---------------------------------------------------------------------------
 # Static UTC peak hours per city (typical daily high window in UTC)
@@ -232,6 +233,17 @@ def _is_on_cooldown(city: str, bucket: int | None, date: str) -> bool:
 def _mark_pushed(city: str, bucket: int | None, date: str) -> None:
     key = f"{city}|{bucket}|{date}"
     _signal_cooldown[key] = time.time()
+
+
+def _is_postpeak_on_cooldown(city: str, bucket: int | None, date: str) -> bool:
+    key = f"{city}|{bucket}|{date}"
+    last = _postpeak_cooldown.get(key, 0)
+    return (time.time() - last) < SIGNAL_COOLDOWN_SEC
+
+
+def _mark_postpeak_pushed(city: str, bucket: int | None, date: str) -> None:
+    key = f"{city}|{bucket}|{date}"
+    _postpeak_cooldown[key] = time.time()
 
 
 def _send_telegram(text: str) -> None:
@@ -1208,11 +1220,40 @@ def scan(*, dry_run: bool = False, bankroll: float = DEFAULT_BANKROLL, wave: str
             risk_str = f" | Risks: {', '.join(str(r) for r in risks)}" if risks else ""
             print(f"  {d['city']:<14} bucket={llm.get('bucket')}  {llm.get('reasoning', '')}{risk_str}")
 
-    # 6. Telegram push — two tiers:
+    # 6. Telegram push — two independent tiers, each with own cooldown:
     #    @postpeak: only speed-alpha signals (post-peak, bucket confirmed, market 5-70%)
     #    Legacy channel: all BUY YES signals (unchanged behaviour)
 
-    # Filter out signals already pushed recently
+    # --- @postpeak: classify ALL buys, apply postpeak-specific cooldown ---
+    speed_alpha_buys = []
+    for d in buys:
+        d["max_so_far"] = d.get("detail", {}).get("current", {}).get("max_so_far")
+        llm = d["llm"]
+        city = d["city"]
+        bucket = llm.get("bucket")
+        date = d.get("market_scan", {}).get("selected_date", "")
+
+        if not is_speed_alpha_trade(d):
+            mode = d.get("entry_mode", "?")
+            reason = []
+            if mode != "post_peak":
+                reason.append(f"mode={mode}")
+            mkt_p = llm.get("estimated_market_price") or 0
+            if mkt_p < SPEED_ALPHA_MKT_MIN:
+                reason.append(f"mkt={mkt_p:.1%}<5%")
+            elif mkt_p > SPEED_ALPHA_MKT_MAX:
+                reason.append(f"mkt={mkt_p:.1%}>70%")
+            print(f"  {city} bucket={bucket} — not speed-alpha "
+                  f"({', '.join(reason) or 'bucket unconfirmed'})")
+        elif _is_postpeak_on_cooldown(city, bucket, date):
+            print(f"  {city} bucket={bucket} — speed-alpha but on @postpeak cooldown")
+        else:
+            mkt_p = llm.get("estimated_market_price") or 0
+            print(f"  {city} bucket={bucket} — SPEED ALPHA "
+                  f"(post-peak, confirmed, mkt={mkt_p:.0%})")
+            speed_alpha_buys.append(d)
+
+    # --- Legacy channel: apply legacy cooldown separately ---
     fresh_buys = []
     for d in buys:
         llm = d["llm"]
@@ -1220,34 +1261,9 @@ def scan(*, dry_run: bool = False, bankroll: float = DEFAULT_BANKROLL, wave: str
         bucket = llm.get("bucket")
         date = d.get("market_scan", {}).get("selected_date", "")
         if _is_on_cooldown(city, bucket, date):
-            print(f"  {city} bucket={bucket} — on cooldown, skipping push")
+            print(f"  {city} bucket={bucket} — on legacy cooldown, skipping push")
         else:
             fresh_buys.append(d)
-
-    # Classify each fresh buy as speed-alpha or not
-    speed_alpha_buys = []
-    other_buys = []
-    for d in fresh_buys:
-        # Attach max_so_far from the detail data for the finality gate
-        d["max_so_far"] = d.get("detail", {}).get("current", {}).get("max_so_far")
-        if is_speed_alpha_trade(d):
-            speed_alpha_buys.append(d)
-            mkt_p = d["llm"].get("estimated_market_price") or 0
-            print(f"  {d['city']} bucket={d['llm'].get('bucket')} — SPEED ALPHA "
-                  f"(post-peak, confirmed, mkt={mkt_p:.0%})")
-        else:
-            mode = d.get("entry_mode", "?")
-            reason = []
-            if mode != "post_peak":
-                reason.append(f"mode={mode}")
-            mkt_p = d["llm"].get("estimated_market_price") or 0
-            if mkt_p < SPEED_ALPHA_MKT_MIN:
-                reason.append(f"mkt={mkt_p:.1%}<5%")
-            elif mkt_p > SPEED_ALPHA_MKT_MAX:
-                reason.append(f"mkt={mkt_p:.1%}>70%")
-            other_buys.append(d)
-            print(f"  {d['city']} bucket={d['llm'].get('bucket')} — not speed-alpha "
-                  f"({', '.join(reason) or 'bucket unconfirmed'})")
 
     def _build_chart_slug(d):
         """Build Polymarket chart slug for a decision."""
@@ -1290,6 +1306,9 @@ def scan(*, dry_run: bool = False, bankroll: float = DEFAULT_BANKROLL, wave: str
                     chart_url = f"https://polymarket.com/api/og?mslug={slug}"
                     print(f"  @postpeak chart for {d['city']}: {chart_url[:60]}...")
                     _send_postpeak_telegram_photo(chart_url, caption)
+                # Mark postpeak cooldown (independent of legacy)
+                _mark_postpeak_pushed(d["city"], d["llm"].get("bucket"),
+                                      d.get("market_scan", {}).get("selected_date", ""))
             print("Sent to @postpeak.")
         else:
             print("[DRY RUN] Would send speed-alpha signals to @postpeak.")
