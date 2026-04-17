@@ -578,6 +578,23 @@ def _build_user_prompt(city_name: str, d: dict, ms: dict) -> str:
     dist_raw = prob.get("distribution", [])
     sorted_dist = sorted(dist_raw, key=lambda b: b.get("probability", 0), reverse=True)
 
+    # Pre-compute top-2 bucket strings to avoid index errors on single-bucket distributions
+    top1_str = (
+        f"{sorted_dist[0].get('value')}deg @ {sorted_dist[0].get('probability', 0)*100:.1f}% "
+        f"(range: {sorted_dist[0].get('range', '?')})"
+    ) if sorted_dist else "? (no distribution)"
+    if len(sorted_dist) > 1:
+        b2 = sorted_dist[1]
+        top2_str = (
+            f"{b2.get('value')}deg @ {b2.get('probability', 0)*100:.1f}% "
+            f"(range: {b2.get('range', '?')})"
+        )
+        adjacent = abs((sorted_dist[0].get('value') or 0) - (b2.get('value') or 0)) <= 1
+    else:
+        top2_str = "(none — single-bucket distribution)"
+        adjacent = False
+    combined_top2 = sum(b.get('probability', 0) for b in sorted_dist[:2]) * 100
+
     return f"""\
 CITY: {city_name}
 DATE: {d.get('local_date', '?')}
@@ -585,10 +602,10 @@ LOCAL TIME: {d.get('local_time', '?')}
 ENTRY MODE: {entry_mode_val}
 
 TOP-2 BUCKET ANALYSIS:
-- Top bucket: {sorted_dist[0].get('value') if sorted_dist else '?'}deg @ {sorted_dist[0].get('probability', 0)*100:.1f}% (range: {sorted_dist[0].get('range','?')})
-- 2nd bucket: {sorted_dist[1].get('value') if len(sorted_dist) > 1 else '?'}deg @ {sorted_dist[1].get('probability', 0)*100:.1f}% (range: {sorted_dist[1].get('range','?')})
-- Combined top-2 probability: {sum(b.get('probability',0) for b in sorted_dist[:2])*100:.1f}%
-- Are they adjacent? {'YES' if sorted_dist and len(sorted_dist) > 1 and abs((sorted_dist[0].get('value') or 0) - (sorted_dist[1].get('value') or 0)) <= 1 else 'NO'}
+- Top bucket: {top1_str}
+- 2nd bucket: {top2_str}
+- Combined top-2 probability: {combined_top2:.1f}%
+- Are they adjacent? {'YES' if adjacent else 'NO'}
 
 ========== CURRENT ANCHOR STATE ==========
 - Current temp: {cur.get('temp')} | Max so far: {cur.get('max_so_far')}
@@ -1318,7 +1335,7 @@ def scan(*, dry_run: bool = False, bankroll: float = DEFAULT_BANKROLL, wave: str
 
 def loop(*, dry_run: bool, bankroll: float, wave: str, interval: int):
     """Run scan repeatedly, aligned with METAR update cadence."""
-    print(f"Alpha Scanner LOOP mode — interval={interval}s ({interval/60:.0f}min)")
+    print(f"Alpha Scanner LOOP mode — interval=15-30s random")
     print(f"  Cooldown per signal: {SIGNAL_COOLDOWN_SEC}s ({SIGNAL_COOLDOWN_SEC/60:.0f}min)")
     print(f"  Press Ctrl+C to stop\n")
 
@@ -1337,14 +1354,15 @@ def loop(*, dry_run: bool, bankroll: float, wave: str, interval: int):
         except Exception as e:
             print(f"\n[ERROR] Scan cycle {cycle} failed: {e}")
 
-        # Sleep until next cycle
-        next_ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
-        wake = (datetime.now(timezone.utc).timestamp() + interval)
-        wake_str = datetime.fromtimestamp(wake, tz=timezone.utc).strftime("%H:%M UTC")
-        print(f"\nSleeping {interval}s — next scan at ~{wake_str}")
+        # Sleep a random 15-30s before next cycle (avoid predictable polling pattern)
+        import random
+        delay = random.uniform(15, 30)
+        wake = datetime.now(timezone.utc).timestamp() + delay
+        wake_str = datetime.fromtimestamp(wake, tz=timezone.utc).strftime("%H:%M:%S UTC")
+        print(f"\nSleeping {delay:.0f}s — next scan at ~{wake_str}")
 
         try:
-            time.sleep(interval)
+            time.sleep(delay)
         except KeyboardInterrupt:
             print("\nStopped by user.")
             break
