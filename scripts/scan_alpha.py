@@ -856,17 +856,32 @@ def _format_telegram_message(decisions: list, bankroll: float) -> str:
         llm = d["llm"]
         ms = d["market_scan"]
         city = d["city"]
+        city_name = d.get("name", city).lower().replace(" ", "-")
         size_pct = llm.get("size_pct_of_bankroll") or 0
         size_usd = bankroll * (size_pct / 100.0)
-        slug = ms.get("selected_slug", "")
-        q = (ms.get("primary_market") or {}).get("question", "")
         mp = llm.get("model_probability") or 0
         mkp = llm.get("estimated_market_price") or 0
         ep = llm.get("edge_pct")
         ep_str = f"{ep:+.1f}%" if isinstance(ep, (int, float)) else str(ep)
+        llm_bucket = llm.get("bucket")
+
+        # Build slug from LLM's bucket — NOT the API's selected_slug which may
+        # point to a different temperature threshold market entirely.
+        base_slug = ms.get("selected_slug", "")
+        unit_suffix = "f" if "f" in base_slug.split("-")[-1] else "c"
+        date_str = ms.get("selected_date", "")
+        if llm_bucket and date_str:
+            try:
+                _dt = datetime.strptime(date_str, "%Y-%m-%d")
+                date_part = _dt.strftime("%B-%-d-%Y").lower()
+            except Exception:
+                date_part = date_str
+            slug = f"highest-temperature-in-{city_name}-on-{date_part}-{llm_bucket}{unit_suffix}"
+        else:
+            slug = base_slug
 
         lines.append(f"{i}. {city} | {(llm.get('confidence') or '?').upper()} confidence")
-        lines.append(f"   Bucket: {llm.get('bucket')}deg")
+        lines.append(f"   Bucket: {llm_bucket}deg")
         lines.append(f"   Model: {mp:.1%} vs Market: {mkp:.1%}")
         lines.append(f"   Edge: {ep_str}")
         lines.append(f"   Size: ${size_usd:.0f} ({size_pct:.1f}% of ${bankroll:.0f}) [1/4 Kelly]")
@@ -875,8 +890,6 @@ def _format_telegram_message(decisions: list, bankroll: float) -> str:
         risks = llm.get("risk_factors", [])
         if risks:
             lines.append(f"   Risks: {', '.join(risks)}")
-        if q:
-            lines.append(f"   Market: {q}")
         if slug:
             lines.append(f"   Link: https://polymarket.com/market/{slug}")
         lines.append("")
