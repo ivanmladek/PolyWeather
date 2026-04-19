@@ -927,15 +927,11 @@ def scan(*, dry_run: bool = False, bankroll: float = DEFAULT_BANKROLL, wave: str
     now_utc = datetime.now(timezone.utc)
     print(f"Current UTC: {now_utc.strftime('%H:%M')}\n")
 
+    # Phase 1: fast timing pre-filter (no API calls)
+    timing_eligible = []
     for c in cities:
         name = c["name"]
         display = c["display_name"]
-        sys.stdout.write(f"  {display:<16}")
-        sys.stdout.flush()
-
-        # UTC peak pre-filter: two entry modes
-        # MODE 1: "golden hour" — 1-3h before peak (37.5% bucket accuracy)
-        # MODE 2: "post-peak capture" — 0-2h after peak (66% accuracy)
         h_to_peak = _city_hours_to_peak_utc(name)
         entry_mode = None
         if h_to_peak is not None:
@@ -944,27 +940,53 @@ def scan(*, dry_run: bool = False, bankroll: float = DEFAULT_BANKROLL, wave: str
             elif -POST_PEAK_MAX <= h_to_peak < 0:
                 entry_mode = "post_peak"
             else:
-                print(f" SKIP timing (peak in {h_to_peak:+.1f}h, need {GOLDEN_HOUR_MIN}-{GOLDEN_HOUR_MAX}h or post-peak)")
+                print(f"  {display:<16} SKIP timing (peak in {h_to_peak:+.1f}h, need {GOLDEN_HOUR_MIN}-{GOLDEN_HOUR_MAX}h or post-peak)")
                 skipped_reasons[display] = f"timing={h_to_peak:+.1f}h"
                 continue
+        timing_eligible.append((name, display, entry_mode, h_to_peak))
 
-        # Fetch regular endpoint (fresh METAR/weather)
-        try:
-            d = _api_get(f"/api/city/{name}")
-        except Exception as e:
-            print(f" FETCH ERROR (city): {e}")
+    # Phase 2: parallel API fetch for eligible cities
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _fetch_city_data(name: str) -> tuple[dict, dict]:
+        """Fetch city + detail endpoints. Returns (city_data, detail_data)."""
+        d = _api_get(f"/api/city/{name}")
+        detail = _api_get(f"/api/city/{name}/detail")
+        return d, detail
+
+    PARALLEL_WORKERS = 10
+    city_data = {}  # name -> (city_data, detail_data)
+
+    if timing_eligible:
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as pool:
+            futures = {pool.submit(_fetch_city_data, name): (name, display)
+                       for name, display, _, _ in timing_eligible}
+            for future in as_completed(futures):
+                name, display = futures[future]
+                try:
+                    city_data[name] = future.result()
+                except Exception as e:
+                    print(f"  {display:<16} FETCH ERROR: {e}")
+        fetch_ms = (time.time() - t0) * 1000
+        print(f"  Fetched {len(city_data)}/{len(timing_eligible)} cities in {fetch_ms:.0f}ms "
+              f"({PARALLEL_WORKERS} workers)\n")
+
+    # Phase 3: apply filters on fetched data (fast, no I/O)
+    for name, display, entry_mode, h_to_peak in timing_eligible:
+        if name not in city_data:
             continue
 
-        # Get structural signals from detail endpoint
-        try:
-            detail = _api_get(f"/api/city/{name}/detail")
-            for key in ("vertical_profile_signal", "taf", "official_nearby",
-                        "network_lead_signal", "network_spread_signal",
-                        "metar_recent_obs", "settlement_today_obs"):
-                if key not in d or not d[key]:
-                    d[key] = detail.get(key, d.get(key))
-        except Exception:
-            pass
+        d, detail = city_data[name]
+        sys.stdout.write(f"  {display:<16}")
+        sys.stdout.flush()
+
+        # Merge structural signals from detail into city data
+        for key in ("vertical_profile_signal", "taf", "official_nearby",
+                    "network_lead_signal", "network_spread_signal",
+                    "metar_recent_obs", "settlement_today_obs"):
+            if key not in d or not d[key]:
+                d[key] = detail.get(key, d.get(key))
 
         peak = d.get("peak", {})
         tr = d.get("trend", {})
@@ -973,12 +995,8 @@ def scan(*, dry_run: bool = False, bankroll: float = DEFAULT_BANKROLL, wave: str
         prob = d.get("probabilities", {})
         dist = prob.get("distribution", [])
 
-        # Use the detail endpoint's market_scan — now returns prices even for past_end_time
-        try:
-            detail = _api_get(f"/api/city/{name}/detail")
-            ms = detail.get("market_scan", {}) or {}
-        except Exception:
-            ms = {}
+        # Use the detail endpoint's market_scan
+        ms = detail.get("market_scan", {}) or {}
 
         # Also grab top_buckets for LLM context (each has its own market price)
         top_buckets = ms.get("top_buckets", [])
@@ -1130,8 +1148,9 @@ def scan(*, dry_run: bool = False, bankroll: float = DEFAULT_BANKROLL, wave: str
             _send_telegram(msg)
         return
 
-    # 4. LLM evaluation (top N only)
+    # 4. LLM evaluation (top N only, skip obvious non-alpha)
     decisions = []
+    llm_skipped = 0
     for cand in llm_candidates:
         city = cand["city"]
         d = cand["detail"]
@@ -1140,6 +1159,20 @@ def scan(*, dry_run: bool = False, bankroll: float = DEFAULT_BANKROLL, wave: str
         ms["_entry_mode"] = cand["entry_mode"]
 
         mode_tag = cand["entry_mode"]
+
+        # Skip LLM for candidates that can't pass the speed-alpha or Kelly gate:
+        # market > 70% (already priced in) or market < 5% (bucket mismatch)
+        mkt_p = ms.get("market_price")
+        if mkt_p is not None:
+            if mkt_p > 0.70:
+                print(f"LLM skip: {city} [{mode_tag}] — market {mkt_p:.0%} > 70% (priced in)")
+                llm_skipped += 1
+                continue
+            if mkt_p < 0.01:
+                print(f"LLM skip: {city} [{mode_tag}] — market {mkt_p:.1%} < 1% (likely mismatch)")
+                llm_skipped += 1
+                continue
+
         print(f"LLM evaluating: {city} [{mode_tag}] (edge={cand['edge']:+.1f}%) ...")
 
         user_prompt = _build_user_prompt(city, d, ms)
@@ -1203,6 +1236,9 @@ def scan(*, dry_run: bool = False, bankroll: float = DEFAULT_BANKROLL, wave: str
         })
 
         time.sleep(0.5)  # rate limit courtesy
+
+    if llm_skipped:
+        print(f"\n({llm_skipped} candidates skipped LLM — market price outside tradeable range)")
 
     # 5. Output
     print(f"\n{'='*70}")
