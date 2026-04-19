@@ -1460,7 +1460,7 @@ def scan(*, dry_run: bool = False, bankroll: float = DEFAULT_BANKROLL, wave: str
 
 def loop(*, dry_run: bool, bankroll: float, wave: str, interval: int):
     """Run scan repeatedly, aligned with METAR update cadence."""
-    print(f"Alpha Scanner LOOP mode — interval=2-4s between cycles")
+    print(f"Alpha Scanner LOOP mode — continuous (no sleep)")
     print(f"  Cooldown per signal: {SIGNAL_COOLDOWN_SEC}s ({SIGNAL_COOLDOWN_SEC/60:.0f}min)")
     print(f"  Press Ctrl+C to stop\n")
 
@@ -1479,18 +1479,8 @@ def loop(*, dry_run: bool, bankroll: float, wave: str, interval: int):
         except Exception as e:
             print(f"\n[ERROR] Scan cycle {cycle} failed: {e}")
 
-        # Brief pause between cycles — scans are now fast (~5s) with parallel fetches
-        import random
-        delay = random.uniform(2, 4)
-        wake = datetime.now(timezone.utc).timestamp() + delay
-        wake_str = datetime.fromtimestamp(wake, tz=timezone.utc).strftime("%H:%M:%S UTC")
-        print(f"\nSleeping {delay:.0f}s — next scan at ~{wake_str}")
+        # No sleep — internal API endpoint, cycle as fast as possible
 
-        try:
-            time.sleep(delay)
-        except KeyboardInterrupt:
-            print("\nStopped by user.")
-            break
 
 
 # ---------------------------------------------------------------------------
