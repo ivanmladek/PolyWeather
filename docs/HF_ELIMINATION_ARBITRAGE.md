@@ -98,14 +98,76 @@ The existing `apply_city_settlement()` handles all three. We just ask it:
 "what bucket does `hf_max` round to?" → any bucket strictly below that is
 eliminated.
 
-### Multi-bucket elimination cascade
+### Multi-bucket elimination cascade (single snapshot)
 
-One city can eliminate **multiple consecutive buckets at once**.
+One city can eliminate **multiple consecutive buckets at once** if temperature
+jumps between observations.
 
-Example — HF at SF jumps from 65°F → 68°F:
+Example — HF at SF jumps from 65°F → 68°F in 5 minutes:
 - Eliminates 64-65°F ✓
 - Eliminates 66-67°F ✓
 - Two NO trades from one HF reading
+
+### Sequential elimination cascade (throughout the day) — THE REAL OPPORTUNITY
+
+The far bigger alpha: **each new bucket crossed during the day is a fresh,
+independent trade**. Temperature rises monotonically from morning minimum to
+afternoon peak, and each bucket boundary crossed is a permanent elimination
+that we can exploit as it happens.
+
+**Live example — New York Apr 19, single day trajectory:**
+
+| Time | HF reading | Bucket entered | Buckets now dead | Trade fires |
+|---|---|---|---|---|
+| 02:10 | 55.4°F | 54-55°F | 52-53°F and below | 1 elim trade |
+| 05:00 | 53°F (overnight min) | 52-53°F | — | — |
+| 08:45 | 56.2°F | 56-57°F | 52-55°F (2 new buckets) | 2 elim trades |
+| 10:30 | 59.8°F | 58-59°F | 56-57°F | 1 elim trade |
+| 11:15 | 62.0°F | 62-63°F | 58-61°F (2 new) | 2 elim trades |
+| 12:00 | 64.3°F | 64-65°F | 62-63°F | 1 elim trade |
+| 13:30 | 66.5°F | 66-67°F | 64-65°F | 1 elim trade |
+| 14:45 | 68.0°F | 68-69°F | 66-67°F | 1 elim trade |
+| 15:30 | 68.0°F (stable, peak) | — | — | — |
+
+**Total:** 9 elimination trades fired from a single city on a single day, each
+with its own ~10-50 minute alpha window before the next METAR catches up.
+
+### Why this matters for sizing and frequency
+
+- **Cities × peak-hour window × buckets-crossed-per-day** = total opportunity
+- Typical US summer day: 10 cities × 5-8 buckets crossed = **50-80 elim trades**
+- Even at $20 avg position with 3% avg edge = $30-50/day realized P&L on
+  modest capital
+
+### State tracking: per-bucket cooldown per city per day
+
+Because the same city fires multiple trades through the day, we must track
+**which buckets we've already traded** to avoid duplicate fills:
+
+```python
+# Key format: (city, date, bucket_label) → traded_at_timestamp
+_elim_cooldown: dict[tuple[str, str, str], float] = {}
+
+def _elim_already_traded(city: str, date: str, bucket_label: str) -> bool:
+    return (city, date, bucket_label) in _elim_cooldown
+```
+
+Unlike the existing `@postpeak` cooldown (one trade per city per day at the
+predicted bucket), elim-arb cooldown is **per-bucket** — a city can legitimately
+fire 5-8 distinct elim trades on the same day, one per bucket boundary crossed.
+
+### Ordering and re-entry rules
+
+1. **First-cross wins:** fire ONLY on the first observation that crosses a
+   bucket boundary. Subsequent HF readings in the same or higher bucket should
+   NOT re-fire the same bucket.
+2. **Skip-gaps:** if HF jumps 3°F in 5 min and crosses 2 bucket boundaries at
+   once, fire both trades simultaneously (each with its own cooldown entry).
+3. **No re-entry on retracement:** if temperature dips back below the boundary,
+   do NOT fire again when it crosses back. The bucket is already eliminated
+   permanently by the earlier reading.
+4. **Day-boundary reset:** at local midnight, reset all elim cooldowns for the
+   new day's markets.
 
 ---
 
@@ -137,6 +199,7 @@ Add to analysis result:
   "hf_max": 68.0,
   "hf_max_time": "12:05",
   "hf_bucket": "68-69°F",
+  "hf_current_bucket_upper": 69.499,
   "eliminated_buckets": [
     {
       "label": "64-65°F",
@@ -145,6 +208,8 @@ Add to analysis result:
       "locked_edge_pct": 0.1,
       "liquidity": 4837,
       "no_size_available": ...,
+      "eliminated_at_utc": "2026-04-19T18:45:00Z",   # first HF tick that killed it
+      "eliminated_by_temp": 66.0,                    # HF reading that crossed
     },
     {
       "label": "66-67°F",
@@ -153,20 +218,54 @@ Add to analysis result:
       "locked_edge_pct": 5.3,
       "liquidity": 3680,
       "no_size_available": ...,
+      "eliminated_at_utc": "2026-04-19T20:05:00Z",
+      "eliminated_by_temp": 68.0,
     }
   ],
   "live_buckets": ["68-69°F", "70°F or higher"],
+  "newly_eliminated_this_tick": ["66-67°F"],   # buckets eliminated since last scan
 }
 ```
+
+The `newly_eliminated_this_tick` field is the key for scanner logic — it tells
+us which buckets just crossed on THIS scan vs which were already dead before.
+Only newly-eliminated buckets should trigger a fresh Telegram alert.
 
 ### 5.3 Scanner — new pathway in `scripts/scan_alpha.py`
 
 Add an `evaluate_elimination_trades(detail)` function that:
-1. Reads `elimination_analysis`
+1. Reads `elimination_analysis.eliminated_buckets`
 2. Filters for `no_price < 0.98` AND `locked_edge_pct >= 1.5%` (tunable floor
    to cover Polymarket fees + slippage)
 3. Filters for sufficient NO-side liquidity (`≥ $500` depth)
-4. Produces a separate `elim_trades` list parallel to the existing `buys` list
+4. **Skips buckets already in per-bucket elim cooldown** (see state tracking
+   above) — this is critical because one city will fire multiple elim trades
+   during the day, one per bucket boundary crossed
+5. Produces a separate `elim_trades` list parallel to the existing `buys` list
+
+**Per-bucket cooldown state:**
+
+```python
+# Separate cooldown dict from the existing @postpeak cooldown.
+# Key: (city, date, bucket_label). Entries are NEVER cleared within the day —
+# once a bucket is traded it stays traded. Cleared at local midnight.
+_elim_cooldown: dict[tuple[str, str, str], float] = {}
+
+def _is_elim_on_cooldown(city: str, date: str, bucket_label: str) -> bool:
+    return (city, date, bucket_label) in _elim_cooldown
+
+def _mark_elim_pushed(city: str, date: str, bucket_label: str) -> None:
+    _elim_cooldown[(city, date, bucket_label)] = time.time()
+
+def _reset_elim_cooldown_for_new_day() -> None:
+    """Call at midnight UTC (or per-city local midnight) to reset trades."""
+    _elim_cooldown.clear()
+```
+
+Distinct from the existing `@postpeak` cooldown (one trade per city per day
+at the predicted bucket). The elim cooldown is per-bucket so a city can fire
+5-8 distinct elim trades in a single day as temperature rises through
+consecutive boundaries.
 
 ### 5.4 Telegram — new section or channel
 
@@ -177,24 +276,51 @@ Recommend **Option B** because the trade mechanics are different (NO side,
 multiple per city, different sizing logic) and we want to evaluate the
 backtested PnL separately without polluting the existing feed.
 
-The elim-arb message must include:
-```
-[ELIM-ARB] SAN FRANCISCO | hf_max=68°F @ 12:05 (KSFO) | 226 obs @ 5min cadence
-  Eliminated buckets (can't win YES):
-    - 64-65°F  NO=0.999  edge=0.1%  liq=$4,837  [skip: below threshold]
-    - 66-67°F  NO=0.950  edge=5.3%  liq=$3,680  **TRADE**
-  Live buckets:
-    - 68-69°F (current)  YES=0.82
-    - 70°F+  YES=0.08  (possible if warming continues)
+Each scan may produce multiple elim-arb trades across different cities AND
+multiple buckets from the same city. The Telegram message must present them
+clearly with one ACTION block per trade:
 
-  ACTION: BUY_NO  market_slug=highest-temperature-in-san-francisco-on-april-19-2026-66-67f
-    target_fill_price<=0.955  min_size_usd=$50  max_size_usd=$X (see sizing)
-    locked_edge_pct=5.3  time_to_metar_confirm=~18min
-    rationale: HF max 68°F already exceeds upper bound of 66-67°F bucket.
-               Monotonic daily max cannot re-enter this bucket.
-               Risk: settlement source revision / sensor error (historical <0.1%).
-    url=https://polymarket.com/market/highest-temperature-in-san-francisco-on-april-19-2026-66-67f
 ```
+[ELIM-ARB] 3 trades this cycle
+
+=== SAN FRANCISCO ===
+  hf_max=68.0°F @ 12:05 (KSFO) | 226 obs @ 5min cadence
+  session trajectory: 52°F(00:15)→56°F(08:45)→62°F(11:15)→68°F(12:05)
+  buckets eliminated today so far: [52-53, 54-55, 56-57, 58-59, 60-61, 62-63, 64-65, 66-67]
+  buckets already traded (cooldown): [52-53, 54-55, 56-57, 60-61, 62-63, 64-65]
+  NEWLY ELIMINATED THIS CYCLE: [66-67°F]
+  live buckets: [68-69°F (current), 70°F+]
+
+  [1] TRADE: BUY_NO 66-67°F @ 95c  (edge=5.3%  liq=$3,680)
+      market_slug=highest-temperature-in-san-francisco-on-april-19-2026-66-67f
+      target_fill_price<=0.955  min_size_usd=$50  max_size_usd=$50
+      eliminated_at=12:05  crossed_by=68.0°F  bucket_upper=67.499°F
+      time_to_metar_confirm=~18min
+      rationale: HF 68.0°F > 67.499°F (bucket upper); daily max cannot retreat
+      url=https://polymarket.com/market/highest-temperature-in-san-francisco-on-april-19-2026-66-67f
+
+=== HOUSTON ===
+  hf_max=80.2°F @ 13:40 (KHOU) | 198 obs @ 5min cadence
+  session trajectory: 58°F(00:00)→65°F(08:00)→72°F(11:00)→78°F(13:00)→80.2°F(13:40)
+  NEWLY ELIMINATED THIS CYCLE: [76-77°F, 78-79°F]   <-- cascade: 2 trades
+
+  [2] TRADE: BUY_NO 76-77°F @ 97c  (edge=3.0%  liq=$2,100)
+      market_slug=...-76-77f  ...
+
+  [3] TRADE: BUY_NO 78-79°F @ 89c  (edge=11.0%  liq=$4,500)
+      market_slug=...-78-79f  ...
+      *** HIGH EDGE — likely market hasn't seen 13:40 HF reading yet ***
+
+=== SUMMARY ===
+  total locked edge capital: $150  expected P&L: $6.80
+  all 3 trades fire in parallel; no inter-dependency
+```
+
+**Message design principles:**
+- One ACTION line per distinct BUY_NO trade
+- Show session trajectory so AI can validate the monotonic-rise claim itself
+- Highlight high-edge trades (>8%) with `***` markers for human sanity check
+- Always include per-bucket elim cooldown context so the AI doesn't re-trade
 
 ---
 
@@ -285,6 +411,29 @@ With `no_price = 0.95`, `q = 0.995` (100-bps haircut for operational risk):
   specifically
 - Mitigation: require `liq ≥ $500` on NO side; require `no_price < 0.99`
   (above this the absolute edge is too small to matter anyway)
+
+### 7.7 Cascade-specific: duplicate-fire protection
+
+- The same bucket boundary could be "newly eliminated" on successive scans
+  if our elimination-analysis code is stateless
+- A naive implementation would re-fire 5 elim trades for 66-67°F in SF over
+  the course of 25 minutes (5 scan cycles at 5-min interval)
+- **Mitigation:** per-bucket elim cooldown keyed by `(city, date, bucket)` is
+  mandatory — never clear within the day even if temperature dips back below
+  boundary
+- **Mitigation:** `elimination_analysis.newly_eliminated_this_tick` is computed
+  on the backend by comparing against the previous cached scan's
+  `eliminated_buckets` — this prevents the stateless scanner from re-firing
+
+### 7.8 Cascade-specific: bucket-above partial fill tracking
+
+- We buy NO on 64-65°F at 13:15, then HF crosses into 66-67°F at 13:30 and
+  we want to buy NO on that bucket too
+- If our first fill only partially executed, we still have capital allocated
+  to the earlier trade; need to ensure we don't over-deploy
+- **Mitigation:** the daily cap (15% bankroll across all elim trades) is
+  computed on nominal capital at risk, not locked fills — so partial fills
+  don't free up capacity until actually filled
 
 ---
 
@@ -417,11 +566,30 @@ the city detail endpoint + full bucket ladder from market_scan). The scanner
 and Telegram pipeline gets one new entry path with a simpler, higher-confidence
 signal than the existing speed-alpha.
 
-Expected outcome on a $1,000 bankroll:
-- 3–8 elimination trades per peak-hour window in US cities during warm
-  season
-- Average locked edge ~3% per trade
-- Daily P&L contribution ~$5–20 from elim arb alone at current scale
-- Scales linearly with bankroll up to the liquidity cap on each bucket
+**Critical insight: cascade per city.** The signal is NOT one-shot per city
+— temperature rises through multiple bucket boundaries during the day and
+each crossing is a fresh, independent arb. Per-bucket cooldown state tracks
+which buckets we've already traded so we can fire 5–8 distinct elim trades
+per city per day.
 
-**This is worth building.**
+Expected daily volume on a $1,000 bankroll:
+
+| Scale | Cities × buckets | Trades/day | Avg edge | Avg size | Daily P&L |
+|---|---|---|---|---|---|
+| Conservative (current HF enabled for 10 US cities) | 10 × 5 | 50 | 3% | $15 | ~$22 |
+| Moderate (tighter edge floor, more per-city buckets) | 10 × 7 | 70 | 3.5% | $20 | ~$49 |
+| Aggressive (add cluster validation, lower edge floor) | 10 × 8 | 80 | 2.5% | $25 | ~$50 |
+
+Key scaling levers:
+- **Bankroll:** linear up to per-bucket liquidity cap (~$500-2000 NO side)
+- **Cities covered:** add more US ASOS stations (Denver, Phoenix, Seattle, etc.)
+- **International:** if we get sub-hourly data for EU/Asia aerodromes, same
+  strategy applies with smaller edge windows
+- **Season:** highest volume in transition months (spring/fall) when diurnal
+  temperature swing crosses the most bucket boundaries; summer days with
+  slow steady rise fire 6-8 trades per city, spring days with rapid warm-up
+  can fire 10+
+
+**This is worth building.** The multi-bucket cascade turns what looks like
+a 3-8 trade/day strategy into a 50-80 trade/day strategy, dramatically
+improving Sharpe via trade count even with small per-trade edge.
