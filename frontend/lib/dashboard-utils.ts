@@ -854,40 +854,6 @@ export function getTemperatureChartData(
     }
   });
 
-  // HF (minute-level ASOS / 5-min weather.gov / hourly METAR+SPECI) observations
-  // Build a TRUE sub-hourly scatter/line series at actual timestamps, NOT bucketed
-  // into the 24 hourly `times` slots. This preserves every minute-level observation.
-  const hfTodayObs = Array.isArray(detail.hf_today_obs) ? detail.hf_today_obs : [];
-  const hfSeriesRaw = hfTodayObs
-    .map((item) => {
-      const labelTime = normalizeHm(String(item?.time || ""));
-      const x = hmToMinutes(labelTime);
-      const y = item?.temp;
-      if (x == null || y == null || !Number.isFinite(Number(y))) return null;
-      return {
-        labelTime: labelTime || "",
-        x,
-        y: Number(y),
-        isSpeci: Boolean(item?.is_speci),
-        precision: String(item?.precision || ""),
-      };
-    })
-    .filter(
-      (p): p is { labelTime: string; x: number; y: number; isSpeci: boolean; precision: string } =>
-        p != null,
-    )
-    .sort((a, b) => a.x - b.x);
-  const hasHfData = hfSeriesRaw.length > 0;
-  // Retain bucketed hfPoints ONLY for min/max-range computation (not for plotting)
-  const hfPoints: Array<number | null> = new Array(times.length).fill(null);
-  for (const p of hfSeriesRaw) {
-    const idx = findNearestTimeIndex(times, p.labelTime);
-    if (idx >= 0) {
-      const prev = hfPoints[idx];
-      hfPoints[idx] = prev == null ? p.y : Math.max(prev, p.y);
-    }
-  }
-
   const mgmPoints = new Array(times.length).fill(null);
   if (
     !suppressAnkaraMgmObservation &&
@@ -910,19 +876,6 @@ export function getTemperatureChartData(
     }
   });
 
-  const allValues = [
-    ...debTemps.filter((value) => value != null),
-    ...metarPoints.filter((value) => value != null),
-    ...airportMetarPoints.filter((value) => value != null),
-    ...mgmPoints.filter((value) => value != null),
-    ...mgmHourlyPoints.filter((value) => value != null),
-    ...hfPoints.filter((value) => value != null),
-  ] as number[];
-
-  if (!allValues.length) return null;
-
-  const min = Math.floor(Math.min(...allValues)) - 1;
-  const max = Math.ceil(Math.max(...allValues)) + 1;
   const tafMarkersRaw = Array.isArray(detail.taf?.signal?.markers)
     ? detail.taf?.signal?.markers || []
     : [];
@@ -960,6 +913,55 @@ export function getTemperatureChartData(
     }
     return hour * 60 + minute;
   };
+
+  // HF (minute-level ASOS / 5-min weather.gov / hourly METAR+SPECI) observations
+  // Build a TRUE sub-hourly scatter/line series at actual timestamps, NOT bucketed
+  // into the 24 hourly `times` slots. This preserves every minute-level observation.
+  const hfTodayObs = Array.isArray(detail.hf_today_obs) ? detail.hf_today_obs : [];
+  const hfSeriesRaw = hfTodayObs
+    .map((item) => {
+      const labelTime = normalizeHm(String(item?.time || ""));
+      const x = hmToMinutes(labelTime);
+      const y = item?.temp;
+      if (x == null || y == null || !Number.isFinite(Number(y))) return null;
+      return {
+        labelTime: labelTime || "",
+        x,
+        y: Number(y),
+        isSpeci: Boolean(item?.is_speci),
+        precision: String(item?.precision || ""),
+      };
+    })
+    .filter(
+      (p): p is { labelTime: string; x: number; y: number; isSpeci: boolean; precision: string } =>
+        p != null,
+    )
+    .sort((a, b) => a.x - b.x);
+  const hasHfData = hfSeriesRaw.length > 0;
+  // Retain bucketed hfPoints ONLY for min/max-range computation (not for plotting)
+  const hfPoints: Array<number | null> = new Array(times.length).fill(null);
+  for (const p of hfSeriesRaw) {
+    const idx = findNearestTimeIndex(times, p.labelTime);
+    if (idx >= 0) {
+      const prev = hfPoints[idx];
+      hfPoints[idx] = prev == null ? p.y : Math.max(prev, p.y);
+    }
+  }
+
+  const allValues = [
+    ...debTemps.filter((value) => value != null),
+    ...metarPoints.filter((value) => value != null),
+    ...airportMetarPoints.filter((value) => value != null),
+    ...mgmPoints.filter((value) => value != null),
+    ...mgmHourlyPoints.filter((value) => value != null),
+    ...hfPoints.filter((value) => value != null),
+  ] as number[];
+
+  if (!allValues.length) return null;
+
+  const min = Math.floor(Math.min(...allValues)) - 1;
+  const max = Math.ceil(Math.max(...allValues)) + 1;
+
   const currentMinutes = hmToMinutes(normalizeHm(detail.local_time));
   const peakFirstHour = Number(detail.peak?.first_h);
   const peakLastHour = Number(detail.peak?.last_h);
