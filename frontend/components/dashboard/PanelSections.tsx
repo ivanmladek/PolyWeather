@@ -427,9 +427,10 @@ export function TemperatureChart() {
         backgroundColor: "rgba(234, 179, 8, 0.05)",
         borderColor: "rgba(234, 179, 8, 0.8)",
         borderWidth: 2,
-        data: chartData.datasets.mgmHourlyPoints,
+        data: chartData.datasets.mgmHourlySeries,
         fill: false,
         label: locale === "en-US" ? "MGM Forecast" : "MGM 预报",
+        parsing: false,
         pointHoverRadius: 6,
         pointRadius: 3,
         spanGaps: true,
@@ -440,9 +441,10 @@ export function TemperatureChart() {
         backgroundColor: "rgba(52, 211, 153, 0.05)",
         borderColor: "rgba(52, 211, 153, 0.6)",
         borderWidth: 1.5,
-        data: chartData.datasets.debPast,
+        data: chartData.datasets.debPastSeries,
         fill: true,
         label: locale === "en-US" ? "DEB Forecast" : "DEB 预报",
+        parsing: false,
         pointHoverRadius: 3,
         pointRadius: 0,
         tension: 0.3,
@@ -451,9 +453,10 @@ export function TemperatureChart() {
         borderColor: "rgba(52, 211, 153, 0.35)",
         borderDash: [5, 3],
         borderWidth: 1.5,
-        data: chartData.datasets.debFuture,
+        data: chartData.datasets.debFutureSeries,
         fill: false,
         label: locale === "en-US" ? "DEB Forecast" : "DEB 预报",
+        parsing: false,
         pointRadius: 0,
         tension: 0.3,
       });
@@ -463,33 +466,36 @@ export function TemperatureChart() {
       backgroundColor: "#22d3ee",
       borderColor: "#22d3ee",
       borderWidth: 0,
-      data: chartData.datasets.metarPoints,
+      data: chartData.datasets.metarSeries,
       fill: false,
       label:
         chartData.observationLabel ||
         (locale === "en-US" ? "METAR Observation" : "METAR 实况"),
       order: 0,
+      parsing: false,
       pointHoverRadius: 7,
       pointRadius: 5,
+      showLine: false,
     });
 
-    if (chartData.datasets.mgmPoints.some((value) => value != null)) {
+    if (chartData.datasets.mgmSeries?.length > 0) {
       datasets.push({
         backgroundColor: "#facc15",
         borderColor: "#facc15",
         borderWidth: 0,
-        data: chartData.datasets.mgmPoints,
+        data: chartData.datasets.mgmSeries,
         fill: false,
         label: locale === "en-US" ? "MGM Observation" : "MGM 实测",
         order: -1,
+        parsing: false,
         pointHoverRadius: 9,
         pointRadius: 7,
         showLine: false,
       });
     }
 
-    // HF temperature observations (true 1-min ASOS / 5-min weather.gov / hourly METAR+SPECI)
-    if (chartData.datasets.hasHfData && chartData.datasets.hfPoints.some((value: unknown) => value != null)) {
+    // HF temperature observations — plot ALL points at true sub-hourly timestamps
+    if (chartData.datasets.hasHfData && chartData.datasets.hfSeries?.length > 0) {
       const hfSrcKind = data.hf_source?.source_kind || data.hf_source?.kind;
       const hfLabel =
         hfSrcKind === "asos_1min"
@@ -502,10 +508,11 @@ export function TemperatureChart() {
         backgroundColor: "rgba(251, 146, 60, 0.08)",
         borderColor: "rgba(251, 146, 60, 0.85)",
         borderWidth: 1.5,
-        data: chartData.datasets.hfPoints,
+        data: chartData.datasets.hfSeries,
         fill: false,
         label: hfLabel,
         order: -1,
+        parsing: false,
         pointHoverRadius: 4,
         pointRadius,
         showLine: true,
@@ -522,9 +529,10 @@ export function TemperatureChart() {
         borderColor: "rgba(99, 102, 241, 0.2)",
         borderDash: [2, 4],
         borderWidth: 1,
-        data: chartData.datasets.temps,
+        data: chartData.datasets.tempsSeries,
         fill: false,
         label: locale === "en-US" ? "OM Raw" : "OM 原始",
+        parsing: false,
         pointRadius: 0,
         tension: 0.3,
       });
@@ -533,10 +541,10 @@ export function TemperatureChart() {
     return {
       data: {
         datasets,
-        labels: chartData.times,
+        labels: [],
       },
       options: {
-        interaction: { intersect: false, mode: "index" },
+        interaction: { intersect: false, mode: "nearest" },
         maintainAspectRatio: false,
         plugins: {
           legend: { display: false },
@@ -544,17 +552,34 @@ export function TemperatureChart() {
             backgroundColor: "rgba(15, 23, 42, 0.9)",
             borderColor: "rgba(52, 211, 153, 0.3)",
             borderWidth: 1,
+            callbacks: {
+              title: (items) => {
+                const rawX = items?.[0]?.parsed?.x;
+                if (rawX == null) return "";
+                const min = Math.round(Number(rawX));
+                const h = Math.floor(min / 60);
+                const m = min % 60;
+                return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+              },
+            },
           },
         },
         responsive: true,
         scales: {
           x: {
+            type: "linear",
+            min: chartData.xMin,
+            max: chartData.xMax,
             grid: { color: "rgba(255,255,255,0.04)" },
             ticks: {
-              callback: (_value, index) =>
-                typeof index === "number" && index % 3 === 0
-                  ? chartData.times[index]
-                  : "",
+              callback: (value) => {
+                const num = Number(value);
+                if (!Number.isFinite(num)) return "";
+                const minutes = Math.round(num);
+                if (minutes % 180 !== 0) return "";
+                const h = Math.floor(minutes / 60);
+                return `${String(h).padStart(2, "0")}:00`;
+              },
               color: "#64748b",
               maxRotation: 0,
             },
@@ -564,8 +589,9 @@ export function TemperatureChart() {
             max: chartData.max,
             min: chartData.min,
             ticks: {
-              callback: (value) => `${value}${data.temp_symbol || "°C"}`,
+              callback: (value) => `${Number(value).toFixed(1)}${data.temp_symbol || "°C"}`,
               color: "#64748b",
+              stepSize: 0.5,
             },
           },
         },

@@ -854,25 +854,37 @@ export function getTemperatureChartData(
     }
   });
 
-  // HF (1-minute ASOS) observations — US cities only
-  const hfPoints = new Array(times.length).fill(null);
-  let hasHfData = false;
-  const hfTodayObs = detail.hf_today_obs;
-  if (Array.isArray(hfTodayObs) && hfTodayObs.length > 0) {
-    // Downsample to every 5 minutes for chart clarity, keeping max per bucket
-    const buckets = new Map<number, number>();
-    for (const item of hfTodayObs) {
-      const temp = item.temp;
-      if (temp == null) continue;
-      const index = findNearestTimeIndex(times, String(item.time || ""));
-      if (index >= 0) {
-        const existing = buckets.get(index);
-        buckets.set(index, existing == null ? Number(temp) : Math.max(existing, Number(temp)));
-      }
-    }
-    for (const [index, temp] of buckets) {
-      hfPoints[index] = temp;
-      hasHfData = true;
+  // HF (minute-level ASOS / 5-min weather.gov / hourly METAR+SPECI) observations
+  // Build a TRUE sub-hourly scatter/line series at actual timestamps, NOT bucketed
+  // into the 24 hourly `times` slots. This preserves every minute-level observation.
+  const hfTodayObs = Array.isArray(detail.hf_today_obs) ? detail.hf_today_obs : [];
+  const hfSeriesRaw = hfTodayObs
+    .map((item) => {
+      const labelTime = normalizeHm(String(item?.time || ""));
+      const x = hmToMinutes(labelTime);
+      const y = item?.temp;
+      if (x == null || y == null || !Number.isFinite(Number(y))) return null;
+      return {
+        labelTime: labelTime || "",
+        x,
+        y: Number(y),
+        isSpeci: Boolean(item?.is_speci),
+        precision: String(item?.precision || ""),
+      };
+    })
+    .filter(
+      (p): p is { labelTime: string; x: number; y: number; isSpeci: boolean; precision: string } =>
+        p != null,
+    )
+    .sort((a, b) => a.x - b.x);
+  const hasHfData = hfSeriesRaw.length > 0;
+  // Retain bucketed hfPoints ONLY for min/max-range computation (not for plotting)
+  const hfPoints: Array<number | null> = new Array(times.length).fill(null);
+  for (const p of hfSeriesRaw) {
+    const idx = findNearestTimeIndex(times, p.labelTime);
+    if (idx >= 0) {
+      const prev = hfPoints[idx];
+      hfPoints[idx] = prev == null ? p.y : Math.max(prev, p.y);
     }
   }
 
@@ -1160,7 +1172,10 @@ export function getTemperatureChartData(
   const mgmHourlySeries = buildSeriesPoints(times, mgmHourlyPoints);
   const metarSeries = buildObservationPoints(observationSource);
   const airportMetarSeries = buildObservationPoints(airportMetarSource);
-  const hfSeries = hasHfData ? buildSeriesPoints(times, hfPoints) : [];
+  // True sub-hourly HF series — every observation at its actual timestamp
+  const hfSeries = hasHfData
+    ? hfSeriesRaw.map((p) => ({ labelTime: p.labelTime, x: p.x, y: p.y }))
+    : [];
   const mgmSeries =
     !suppressAnkaraMgmObservation && detail.mgm?.temp != null && detail.mgm?.time
       ? buildObservationPoints([{ time: detail.mgm.time, temp: detail.mgm.temp }])

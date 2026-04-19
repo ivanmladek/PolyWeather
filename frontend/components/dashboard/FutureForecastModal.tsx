@@ -597,9 +597,10 @@ function DailyTemperatureChart({ dateStr }: { dateStr: string }) {
               max: todayChartData.max,
               min: todayChartData.min,
               ticks: {
-                callback: (value) => `${value}${detail.temp_symbol || "°C"}`,
+                callback: (value) => `${Number(value).toFixed(1)}${detail.temp_symbol || "°C"}`,
                 color: "#64748b",
                 font: { family: "Inter", size: 10 },
+                stepSize: todayChartData.datasets.hasHfData ? 0.5 : undefined,
               },
             },
           },
