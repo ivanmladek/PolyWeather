@@ -2366,7 +2366,8 @@ def _analyze(
     # ── HF (high-frequency) temperature data ──
     # Prefer ASOS 1-min (true minute data, US only, 1-2 day lag) over hf_intraday
     # (METAR/SPECI-derived, worldwide, real-time, 0.1°C precision from T-group remarks).
-    _hf_use_f = city_meta.get("use_fahrenheit", False)
+    # CITIES uses key "f" for use_fahrenheit; also accept the original key for safety.
+    _hf_use_f = bool(city_meta.get("f", city_meta.get("use_fahrenheit", False)))
     _hf_asos = raw.get("asos_1min")
     _hf_intraday = raw.get("hf_intraday")
     _hf_src_obj = None
@@ -2941,6 +2942,11 @@ def _build_city_detail_payload(
         "airport_current": data.get("airport_current") or {},
         "nearby_source": data.get("nearby_source") or ("mgm" if str(data.get("name") or "").lower() in TURKISH_MGM_CITIES else "metar_cluster"),
         "ai_analysis": data.get("ai_analysis") or "",
+        # High-frequency intraday observations (pass-through for the /detail aggregate endpoint)
+        "hf_today_obs": data.get("hf_today_obs") or [],
+        "hf_peak_detection": data.get("hf_peak_detection"),
+        "hf_alpha": data.get("hf_alpha"),
+        "hf_source": data.get("hf_source"),
         "errors": {},
     }
 
