@@ -396,9 +396,9 @@ function DailyTemperatureChart({ dateStr }: { dateStr: string }) {
         // Finer-resolution sources get smaller point radius for cleaner visuals
         const pointRadius = hfSrcKind === "asos_1min" ? 1.5 : hfSrcKind === "wgov_5min" ? 2 : 3;
         datasets.push({
-          backgroundColor: "rgba(251, 146, 60, 0.12)",
+          backgroundColor: "rgba(251, 146, 60, 0.7)",
           borderColor: "rgba(251, 146, 60, 0.85)",
-          borderWidth: 1.5,
+          borderWidth: 0,
           data: todayChartData.datasets.hfSeries,
           fill: false,
           label: hfLabel,
@@ -406,9 +406,7 @@ function DailyTemperatureChart({ dateStr }: { dateStr: string }) {
           parsing: false,
           pointHoverRadius: 5,
           pointRadius,
-          showLine: true,
-          spanGaps: true,
-          tension: 0.2,
+          showLine: false,
         });
       }
 
