@@ -153,6 +153,58 @@ class TestSpeedAlphaGate:
         d["llm"]["bucket"] = None
         assert is_speed_alpha_trade(d) is False
 
+    # --- HF (high-frequency) bucket crossing ---
+
+    def test_accepts_hf_bucket_crossed_when_metar_stale(self):
+        """
+        HF data (5-min weather.gov) shows bucket 80 while METAR still shows 79.
+        With bucket_crossed=True and hf_bucket matching predicted bucket,
+        the gate should accept this as a valid speed-alpha signal because
+        this is where the alpha is maximal (market still reading the old METAR).
+        """
+        d = _make_decision(
+            city="Dallas", name="dallas",
+            max_so_far=79.0, bucket=80, market_price=0.15,
+        )
+        # max_so_far=79.0 would round to 79 (not 80), so primary check fails.
+        # But HF override shows bucket crossed to 80 — secondary check passes.
+        d["detail"]["hf_max_override"] = {
+            "bucket_crossed": True,
+            "hf_bucket": 80,
+            "metar_bucket": 79,
+            "hf_max": 79.6,
+            "metar_max": 79.0,
+            "temp_advantage": 0.6,
+            "source_kind": "wgov_5min",
+        }
+        d["hf_max_override"] = d["detail"]["hf_max_override"]
+        assert is_speed_alpha_trade(d) is True
+
+    def test_rejects_hf_bucket_crossed_when_wrong_bucket(self):
+        """HF shows bucket 80, but LLM predicted bucket 81 — reject."""
+        d = _make_decision(
+            city="Dallas", name="dallas",
+            max_so_far=79.0, bucket=81, market_price=0.15,
+        )
+        d["detail"]["hf_max_override"] = {
+            "bucket_crossed": True,
+            "hf_bucket": 80,  # predicted=81, hf=80 → mismatch
+            "metar_bucket": 79,
+            "hf_max": 79.6,
+            "metar_max": 79.0,
+        }
+        d["hf_max_override"] = d["detail"]["hf_max_override"]
+        assert is_speed_alpha_trade(d) is False
+
+    def test_rejects_when_no_hf_and_bucket_mismatch(self):
+        """Without HF override, standard bucket confirmation is required."""
+        d = _make_decision(
+            city="Dallas", name="dallas",
+            max_so_far=79.0, bucket=81, market_price=0.15,
+        )
+        # No hf_max_override at all
+        assert is_speed_alpha_trade(d) is False
+
     # --- HKO city rounding in the gate ---
 
     def test_hko_floor_rounding_in_gate(self):
@@ -371,3 +423,151 @@ class TestConfigConstants:
     def test_sigma_limits(self):
         assert scan_alpha.MAX_SIGMA_GOLDEN == 1.5
         assert scan_alpha.SPEED_ALPHA_SIGMA_MAX == 1.5
+
+
+# ===================================================================
+# Verbose Telegram message formatting with HF context
+# ===================================================================
+
+class TestVerboseTelegramMessage:
+    """The @postpeak message must include full HF context for trading AIs."""
+
+    def _make_buy_with_hf(self):
+        """Build a complete BUY_YES decision with HF override info."""
+        return {
+            "city": "Dallas",
+            "name": "dallas",
+            "entry_mode": "post_peak",
+            "hours_to_peak": -0.3,
+            "sigma": 0.5,
+            "max_so_far": 79.6,
+            "market_scan": {
+                "selected_slug": "highest-temperature-in-dallas-on-april-19-2026-80f",
+                "selected_date": "2026-04-19",
+                "market_price": 0.15,
+                "liquidity": 15000,
+            },
+            "llm": {
+                "action": "BUY_YES",
+                "bucket": 80,
+                "model_probability": 0.72,
+                "estimated_market_price": 0.15,
+                "edge_pct": 57.0,
+                "confidence": "high",
+                "size_pct_of_bankroll": 2.5,
+                "reasoning": "HF shows bucket crossed to 80, METAR still at 79",
+                "risk_factors": [],
+                "time_sensitivity": "immediate",
+            },
+            "detail": {
+                "temp_symbol": "°F",
+                "current": {"max_so_far": 79.6, "max_temp_time": "14:55"},
+                "deb": {"prediction": 80.2},
+                "probabilities": {"mu": 80.1},
+                "hf_source": {
+                    "icao": "KDAL",
+                    "source_kind": "wgov_5min",
+                    "observation_count": 198,
+                    "median_gap_minutes": 5.0,
+                    "max_temp": 79.6,
+                    "max_temp_time": "14:55",
+                    "latest_temp": 79.2,
+                    "latest_time": "15:10",
+                },
+                "hf_max_override": {
+                    "bucket_crossed": True,
+                    "hf_bucket": 80,
+                    "metar_bucket": 79,
+                    "hf_max": 79.6,
+                    "hf_max_time": "14:55",
+                    "metar_max": 79.0,
+                    "metar_max_time": "13:53",
+                    "temp_advantage": 0.6,
+                    "source_kind": "wgov_5min",
+                    "icao": "KDAL",
+                    "hf_observation_count": 198,
+                    "hf_median_gap_min": 5.0,
+                    "hf_beats_metar": True,
+                },
+                "hf_peak_detection": {
+                    "status": "post_peak",
+                    "confidence": 0.72,
+                    "peak_time": "14:55",
+                    "peak_temp_f": 79.6,
+                    "decline_from_peak_f": 0.4,
+                    "hf_trend_direction": "falling",
+                },
+                "hf_alpha": {
+                    "has_alpha": True,
+                    "alpha_type": "hf_post_peak_vs_metar_in_window",
+                    "alpha_minutes": 37,
+                },
+            },
+        }
+
+    def test_verbose_message_contains_hf_override_section(self):
+        d = self._make_buy_with_hf()
+        msg = scan_alpha._format_telegram_message([d], bankroll=1000.0)
+        assert "HF MAX OVERRIDE" in msg
+        assert "BUCKET CROSSED" in msg
+        assert "79.6" in msg  # hf_max
+        assert "79.0" in msg  # metar_max
+        assert "wgov_5min" in msg
+        assert "KDAL" in msg
+
+    def test_verbose_message_contains_hf_peak_detection(self):
+        d = self._make_buy_with_hf()
+        msg = scan_alpha._format_telegram_message([d], bankroll=1000.0)
+        assert "HF PEAK DETECTION" in msg
+        assert "post_peak" in msg
+        assert "14:55" in msg
+
+    def test_verbose_message_contains_alpha_minutes_ahead(self):
+        d = self._make_buy_with_hf()
+        msg = scan_alpha._format_telegram_message([d], bankroll=1000.0)
+        assert "alpha_minutes_ahead_of_metar" in msg
+        assert "37" in msg
+
+    def test_verbose_message_contains_action_payload(self):
+        """Must include structured ACTION data for automated trading AI."""
+        d = self._make_buy_with_hf()
+        msg = scan_alpha._format_telegram_message([d], bankroll=1000.0)
+        assert "ACTION: BUY_YES" in msg
+        assert "market_slug=" in msg
+        assert "target_fill_price" in msg
+        assert "min_size_usd" in msg
+        assert "max_size_usd" in msg
+        assert "polymarket.com/market/" in msg
+
+    def test_verbose_message_contains_market_and_sizing(self):
+        d = self._make_buy_with_hf()
+        msg = scan_alpha._format_telegram_message([d], bankroll=1000.0)
+        assert "MARKET:" in msg
+        assert "SIZING:" in msg
+        assert "TIMING:" in msg
+        assert "model_prob" in msg
+        assert "market_price" in msg
+        assert "edge=" in msg
+
+    def test_verbose_message_handles_missing_hf(self):
+        """Should still format cleanly when HF data is absent."""
+        d = self._make_buy_with_hf()
+        d["detail"].pop("hf_max_override", None)
+        d["detail"].pop("hf_source", None)
+        d["detail"].pop("hf_peak_detection", None)
+        d["detail"].pop("hf_alpha", None)
+        msg = scan_alpha._format_telegram_message([d], bankroll=1000.0)
+        # Core sections should still appear
+        assert "MARKET:" in msg
+        assert "SETTLEMENT ANCHOR:" in msg
+        assert "ACTION: BUY_YES" in msg
+        # HF sections should be omitted (not crash)
+        assert "HF MAX OVERRIDE" not in msg
+
+    def test_verbose_message_bucket_crossed_marker(self):
+        """The key alpha signal: 'BUCKET CROSSED' should be clearly visible."""
+        d = self._make_buy_with_hf()
+        msg = scan_alpha._format_telegram_message([d], bankroll=1000.0)
+        # The asterisk-wrapped BUCKET CROSSED line is the key trading trigger
+        assert "*** BUCKET CROSSED" in msg
+        assert "HF-TRIGGERED ALERT" in msg

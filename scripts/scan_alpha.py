@@ -331,6 +331,11 @@ def is_speed_alpha_trade(decision: dict) -> bool:
     Backtest (Apr 15-17): 14/16 = 87.5% win rate in this window.
     The alpha is speed of interpretation, not prediction — the scanner reads
     the METAR and maps it to a settlement bucket faster than the market reprices.
+
+    HF EXTENSION: when high-frequency (5-min weather.gov / 1-min ASOS) data
+    shows the bucket has been crossed but METAR hasn't yet, we still accept
+    the signal — this is where the alpha is MAXIMAL because the market can't
+    see the bucket crossing until the next hourly METAR (up to 50 minutes later).
     """
     from src.analysis.settlement_rounding import apply_city_settlement
 
@@ -345,7 +350,8 @@ def is_speed_alpha_trade(decision: dict) -> bool:
         return False
 
     detail = decision.get("detail") or decision.get("market_scan", {})
-    # Try multiple paths to find max_so_far
+    # Try multiple paths to find max_so_far (max_so_far is already HF-overridden
+    # by analysis_service.py when HF data shows a higher temp than METAR)
     max_so_far = None
     if isinstance(decision.get("detail"), dict):
         max_so_far = decision["detail"].get("current", {}).get("max_so_far")
@@ -357,8 +363,25 @@ def is_speed_alpha_trade(decision: dict) -> bool:
 
     city_name = decision.get("name") or decision.get("city", "")
     settled_bucket = apply_city_settlement(city_name, max_so_far)
-    if settled_bucket != predicted_bucket:
-        return False
+
+    # Primary check: the overridden max_so_far rounds to predicted bucket
+    if settled_bucket == predicted_bucket:
+        pass  # Confirmed
+    else:
+        # Secondary check: HF max override shows bucket crossed into predicted bucket
+        # even if main rounding disagrees (edge case due to settlement rounding rules)
+        hf_over = (
+            decision.get("hf_max_override")
+            or (decision.get("detail") or {}).get("hf_max_override")
+        )
+        if hf_over and hf_over.get("bucket_crossed"):
+            hf_bucket = hf_over.get("hf_bucket")
+            if hf_bucket == predicted_bucket:
+                pass  # HF confirms — alpha is maximal here
+            else:
+                return False
+        else:
+            return False
 
     # 3. Market must be in the speed-alpha window (5-70%)
     mkt_price = llm.get("estimated_market_price") or 0
@@ -838,6 +861,14 @@ def _call_groq(user_prompt: str) -> dict | None:
 
 
 def _format_telegram_message(decisions: list, bankroll: float) -> str:
+    """Format a VERBOSE telegram message with full trading decision context.
+
+    Designed to be consumed by another AI to issue buy/sell decisions.
+    Includes HF (high-frequency) observation data — 5-min weather.gov or
+    1-min ASOS — which can detect bucket crossings 10-50 minutes BEFORE
+    the next hourly METAR. This is the core alpha for @postpeak alerts.
+    """
+    from src.analysis.settlement_rounding import apply_city_settlement
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"PolyWeather Alpha Scanner | {now_utc}", ""]
 
@@ -864,6 +895,9 @@ def _format_telegram_message(decisions: list, bankroll: float) -> str:
         ep = llm.get("edge_pct")
         ep_str = f"{ep:+.1f}%" if isinstance(ep, (int, float)) else str(ep)
         llm_bucket = llm.get("bucket")
+        entry_mode = d.get("entry_mode", "?")
+        hours_to_peak = d.get("hours_to_peak")
+        sa_flag = "YES" if is_speed_alpha_trade(d) else "NO"
 
         # Build slug from LLM's bucket — NOT the API's selected_slug which may
         # point to a different temperature threshold market entirely.
@@ -880,18 +914,85 @@ def _format_telegram_message(decisions: list, bankroll: float) -> str:
         else:
             slug = base_slug
 
-        lines.append(f"{i}. {city} | {(llm.get('confidence') or '?').upper()} confidence")
-        lines.append(f"   Bucket: {llm_bucket}deg")
-        lines.append(f"   Model: {mp:.1%} vs Market: {mkp:.1%}")
-        lines.append(f"   Edge: {ep_str}")
-        lines.append(f"   Size: ${size_usd:.0f} ({size_pct:.1f}% of ${bankroll:.0f}) [1/4 Kelly]")
-        lines.append(f"   Timing: {llm.get('time_sensitivity', '?')}")
-        lines.append(f"   Reason: {llm.get('reasoning', '?')}")
+        # ====== HEADER ======
+        lines.append(f"[{i}] {city.upper()} | {(llm.get('confidence') or '?').upper()} CONF | {entry_mode} | speed_alpha={sa_flag}")
+        lines.append(f"    Bucket: {llm_bucket}{unit_suffix}  |  Date: {date_str}")
+
+        # ====== MARKET ======
+        lines.append(f"    MARKET:")
+        lines.append(f"      model_prob={mp:.1%}  market_price={mkp:.1%}  edge={ep_str}")
+        liq = ms.get("liquidity") or 0
+        lines.append(f"      liquidity=${liq:,.0f}  sigma={d.get('sigma') or 'n/a'}")
+
+        # ====== SIZING ======
+        lines.append(f"    SIZING:")
+        lines.append(f"      size_usd=${size_usd:.0f}  size_pct={size_pct:.2f}%  bankroll=${bankroll:.0f}  [1/4 Kelly]")
+
+        # ====== TIMING ======
+        peak_str = f"{hours_to_peak:+.1f}h" if hours_to_peak is not None else "n/a"
+        lines.append(f"    TIMING:")
+        lines.append(f"      hours_to_peak={peak_str}  entry_mode={entry_mode}  time_sensitivity={llm.get('time_sensitivity', '?')}")
+
+        # ====== OBSERVATIONS: METAR + HF ======
+        detail = d.get("detail", {}) or {}
+        cur = detail.get("current", {}) or {}
+        max_so_far = cur.get("max_so_far")
+        max_temp_time = cur.get("max_temp_time")
+        temp_symbol = detail.get("temp_symbol", "°")
+        deb = (detail.get("deb") or {}).get("prediction")
+        mu = (detail.get("probabilities") or {}).get("mu")
+
+        lines.append(f"    SETTLEMENT ANCHOR:")
+        lines.append(f"      max_so_far={max_so_far}{temp_symbol}  at {max_temp_time or '--:--'}  bucket={apply_city_settlement(city, max_so_far) if max_so_far is not None else 'n/a'}{unit_suffix}")
+        lines.append(f"      deb_forecast={deb}{temp_symbol}  mu={mu}{temp_symbol}")
+
+        # HF data (high-frequency weather.gov / ASOS)
+        hf_src = d.get("hf_source") or detail.get("hf_source")
+        hf_over = d.get("hf_max_override") or detail.get("hf_max_override")
+        if hf_src and hf_src.get("observation_count", 0) > 0:
+            lines.append(f"    HIGH-FREQUENCY DATA ({hf_src.get('source_kind', 'hf')}):")
+            lines.append(f"      station={hf_src.get('icao')}  obs_count={hf_src.get('observation_count')}  median_gap={hf_src.get('median_gap_minutes')}min")
+            lines.append(f"      latest={hf_src.get('latest_temp')}{temp_symbol} @ {hf_src.get('latest_time')}  max={hf_src.get('max_temp')}{temp_symbol} @ {hf_src.get('max_temp_time')}")
+
+        # HF MAX OVERRIDE — the key alpha signal
+        if hf_over:
+            lines.append(f"    ** HF MAX OVERRIDE **")
+            adv = hf_over.get("temp_advantage", 0)
+            lines.append(f"      hf_max={hf_over.get('hf_max')}{temp_symbol} @ {hf_over.get('hf_max_time') or '--:--'}  bucket={hf_over.get('hf_bucket')}{unit_suffix}")
+            lines.append(f"      metar_max={hf_over.get('metar_max')}{temp_symbol} @ {hf_over.get('metar_max_time') or '--:--'}  bucket={hf_over.get('metar_bucket')}{unit_suffix}")
+            if hf_over.get("bucket_crossed"):
+                lines.append(f"      *** BUCKET CROSSED: HF shows {hf_over.get('hf_bucket')}{unit_suffix} vs METAR {hf_over.get('metar_bucket')}{unit_suffix} (+{adv:.2f}{temp_symbol} advantage)")
+                lines.append(f"      *** This is a HF-TRIGGERED ALERT — acting on 5-min data before next hourly METAR")
+            elif hf_over.get("hf_beats_metar"):
+                lines.append(f"      hf_beats_metar=True (temp_advantage=+{adv:.2f}{temp_symbol})")
+            else:
+                lines.append(f"      hf_beats_metar=False (METAR still leads)")
+
+        # HF peak detection
+        hf_peak = d.get("hf_peak_detection") or detail.get("hf_peak_detection")
+        if hf_peak and hf_peak.get("status") != "insufficient_data":
+            conf_pct = (hf_peak.get("confidence") or 0) * 100
+            lines.append(f"    HF PEAK DETECTION:")
+            lines.append(f"      status={hf_peak.get('status')}  confidence={conf_pct:.0f}%")
+            if hf_peak.get("peak_time"):
+                lines.append(f"      peak_time={hf_peak.get('peak_time')}  peak_temp={hf_peak.get('peak_temp_f') if unit_suffix=='f' else hf_peak.get('peak_temp_c')}{temp_symbol}")
+                lines.append(f"      decline_from_peak={hf_peak.get('decline_from_peak_f') if unit_suffix=='f' else hf_peak.get('decline_from_peak_c')}{temp_symbol}  trend={hf_peak.get('hf_trend_direction')}")
+            alpha = d.get("hf_alpha") or detail.get("hf_alpha")
+            if alpha and alpha.get("has_alpha"):
+                lines.append(f"      alpha_type={alpha.get('alpha_type')}  alpha_minutes_ahead_of_metar={alpha.get('alpha_minutes')}")
+
+        # ====== REASONING ======
+        lines.append(f"    REASONING:")
+        lines.append(f"      {llm.get('reasoning', '?')}")
         risks = llm.get("risk_factors", [])
         if risks:
-            lines.append(f"   Risks: {', '.join(risks)}")
+            lines.append(f"    RISKS: {', '.join(risks)}")
+
+        # ====== ACTION PAYLOAD (structured for automated trading AI) ======
+        lines.append(f"    ACTION: BUY_YES  market_slug={slug}")
+        lines.append(f"      target_fill_price<={mkp:.4f}  min_size_usd=${max(10, size_usd*0.3):.0f}  max_size_usd=${size_usd:.0f}")
         if slug:
-            lines.append(f"   Link: https://polymarket.com/market/{slug}")
+            lines.append(f"      url=https://polymarket.com/market/{slug}")
         lines.append("")
 
     if skips:
@@ -1233,6 +1334,12 @@ def scan(*, dry_run: bool = False, bankroll: float = DEFAULT_BANKROLL, wave: str
             "max_so_far": d.get("current", {}).get("max_so_far"),
             "deb_prediction": d.get("deb", {}).get("prediction"),
             "mu": d.get("probabilities", {}).get("mu"),
+            # HF (5-min weather.gov / 1-min ASOS) data for alpha-speed bucket detection
+            "hf_max_override": d.get("hf_max_override"),
+            "hf_source": d.get("hf_source"),
+            "hf_peak_detection": d.get("hf_peak_detection"),
+            "hf_alpha": d.get("hf_alpha"),
+            "hf_today_obs_count": len(d.get("hf_today_obs") or []),
         })
 
         time.sleep(0.5)  # rate limit courtesy

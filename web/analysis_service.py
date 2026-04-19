@@ -1604,6 +1604,63 @@ def _analyze(
     if max_temp_time == "":
         max_temp_time = None
 
+    # === HF MAX OVERRIDE ===
+    # If high-frequency (5-min weather.gov / 1-min ASOS) data shows a higher
+    # max than METAR, use it. This can detect bucket crossings 10-50 minutes
+    # ahead of the next hourly METAR, which is the core alpha for @postpeak.
+    hf_max_override_info: Optional[Dict] = None
+    _hf_src_for_max = raw.get("asos_1min") or raw.get("hf_intraday")
+    if isinstance(_hf_src_for_max, dict) and _hf_src_for_max.get("observations"):
+        hf_use_f = bool(info.get("f") if isinstance(info, dict) else False)
+        hf_max_candidate = _sf(_hf_src_for_max.get("max_temp_f") if hf_use_f else _hf_src_for_max.get("max_temp_c"))
+        hf_max_time_candidate = _sf(0)  # placeholder
+        hf_max_time_candidate = _hf_src_for_max.get("max_temp_time")
+        if hf_max_candidate is not None and _is_plausible_city_temp(city, hf_max_candidate, sym):
+            # Compare buckets; HF might have crossed into a NEW bucket ahead of METAR
+            try:
+                metar_bucket = apply_city_settlement(city.lower(), max_so_far) if max_so_far is not None else None
+            except Exception:
+                metar_bucket = None
+            try:
+                hf_bucket = apply_city_settlement(city.lower(), hf_max_candidate)
+            except Exception:
+                hf_bucket = None
+
+            hf_beats_metar = (
+                max_so_far is None
+                or hf_max_candidate > max_so_far + 0.01  # strict greater-than with float tolerance
+            )
+
+            # Bucket-crossed detection: HF shows a HIGHER temperature bucket than METAR
+            bucket_crossed = (
+                metar_bucket is not None
+                and hf_bucket is not None
+                and hf_bucket != metar_bucket
+                and hf_max_candidate > (max_so_far or -999)
+            )
+
+            hf_max_override_info = {
+                "source_kind": _hf_src_for_max.get("source_kind") or _hf_src_for_max.get("source"),
+                "icao": _hf_src_for_max.get("icao"),
+                "hf_max": round(hf_max_candidate, 2),
+                "hf_max_time": hf_max_time_candidate,
+                "hf_bucket": hf_bucket,
+                "metar_max": max_so_far,
+                "metar_max_time": max_temp_time,
+                "metar_bucket": metar_bucket,
+                "hf_observation_count": _hf_src_for_max.get("observation_count", 0),
+                "hf_median_gap_min": _hf_src_for_max.get("median_gap_minutes"),
+                "hf_beats_metar": hf_beats_metar,
+                "bucket_crossed": bucket_crossed,
+                "temp_advantage": round(hf_max_candidate - (max_so_far or hf_max_candidate), 2) if max_so_far is not None else 0.0,
+            }
+
+            # Override max_so_far when HF is strictly higher
+            if hf_beats_metar:
+                max_so_far = round(hf_max_candidate, 2)
+                if hf_max_time_candidate:
+                    max_temp_time = hf_max_time_candidate
+
     raw_settlement_max = max_so_far
     wu_settle = apply_city_settlement(city.lower(), raw_settlement_max) if raw_settlement_max is not None else None
     display_settlement_max = wu_settle if settlement_source == "wunderground" and wu_settle is not None else raw_settlement_max
@@ -2411,6 +2468,10 @@ def _analyze(
             "latest_is_speci": _hf_src_obj.get("latest_is_speci", False),
             "latest_precision": _hf_src_obj.get("latest_precision"),
         }
+    # HF max override info (for @postpeak alpha — bucket crossings detected
+    # minutes before the next hourly METAR)
+    if hf_max_override_info is not None:
+        result["hf_max_override"] = hf_max_override_info
     result["intraday_meteorology"] = _build_intraday_meteorology(result)
 
     if include_llm_commentary:
@@ -2562,6 +2623,57 @@ def _analyze_summary(city: str, force_refresh: bool = False) -> Dict[str, Any]:
         mgm_time = str(mg_cur.get("time") or "")
         if " " in mgm_time:
             max_temp_time = mgm_time.split(" ")[1][:5]
+
+    # === HF MAX OVERRIDE (secondary path) ===
+    # Mirror the primary-path HF override so /panel and alternative detail
+    # modes also pick up HF-detected bucket crossings ahead of METAR.
+    hf_max_override_info_2: Optional[Dict] = None
+    _hf_src_for_max_2 = raw.get("asos_1min") or raw.get("hf_intraday")
+    if isinstance(_hf_src_for_max_2, dict) and _hf_src_for_max_2.get("observations"):
+        _hf_use_f_2 = bool(info.get("f") if isinstance(info, dict) else False)
+        hf_max_candidate_2 = _sf(
+            _hf_src_for_max_2.get("max_temp_f")
+            if _hf_use_f_2
+            else _hf_src_for_max_2.get("max_temp_c")
+        )
+        hf_max_time_candidate_2 = _hf_src_for_max_2.get("max_temp_time")
+        if hf_max_candidate_2 is not None and _is_plausible_city_temp(city, hf_max_candidate_2, sym):
+            try:
+                metar_bucket_2 = apply_city_settlement(city.lower(), max_so_far) if max_so_far is not None else None
+            except Exception:
+                metar_bucket_2 = None
+            try:
+                hf_bucket_2 = apply_city_settlement(city.lower(), hf_max_candidate_2)
+            except Exception:
+                hf_bucket_2 = None
+            hf_beats_metar_2 = (
+                max_so_far is None or hf_max_candidate_2 > max_so_far + 0.01
+            )
+            bucket_crossed_2 = (
+                metar_bucket_2 is not None
+                and hf_bucket_2 is not None
+                and hf_bucket_2 != metar_bucket_2
+                and hf_max_candidate_2 > (max_so_far or -999)
+            )
+            hf_max_override_info_2 = {
+                "source_kind": _hf_src_for_max_2.get("source_kind") or _hf_src_for_max_2.get("source"),
+                "icao": _hf_src_for_max_2.get("icao"),
+                "hf_max": round(hf_max_candidate_2, 2),
+                "hf_max_time": hf_max_time_candidate_2,
+                "hf_bucket": hf_bucket_2,
+                "metar_max": max_so_far,
+                "metar_max_time": max_temp_time,
+                "metar_bucket": metar_bucket_2,
+                "hf_observation_count": _hf_src_for_max_2.get("observation_count", 0),
+                "hf_median_gap_min": _hf_src_for_max_2.get("median_gap_minutes"),
+                "hf_beats_metar": hf_beats_metar_2,
+                "bucket_crossed": bucket_crossed_2,
+                "temp_advantage": round(hf_max_candidate_2 - (max_so_far or hf_max_candidate_2), 2) if max_so_far is not None else 0.0,
+            }
+            if hf_beats_metar_2:
+                max_so_far = round(hf_max_candidate_2, 2)
+                if hf_max_time_candidate_2:
+                    max_temp_time = hf_max_time_candidate_2
 
     raw_settlement_max = max_so_far
     wu_settle = (
@@ -2726,6 +2838,8 @@ def _analyze_summary(city: str, force_refresh: bool = False) -> Dict[str, Any]:
         "deviation_monitor": deviation_monitor or {},
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
+    if hf_max_override_info_2 is not None:
+        result["hf_max_override"] = hf_max_override_info_2
     _set_cached_summary(city, result)
     return result
 
