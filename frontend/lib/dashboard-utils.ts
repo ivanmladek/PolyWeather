@@ -854,6 +854,28 @@ export function getTemperatureChartData(
     }
   });
 
+  // HF (1-minute ASOS) observations — US cities only
+  const hfPoints = new Array(times.length).fill(null);
+  let hasHfData = false;
+  const hfTodayObs = detail.hf_today_obs;
+  if (Array.isArray(hfTodayObs) && hfTodayObs.length > 0) {
+    // Downsample to every 5 minutes for chart clarity, keeping max per bucket
+    const buckets = new Map<number, number>();
+    for (const item of hfTodayObs) {
+      const temp = item.temp;
+      if (temp == null) continue;
+      const index = findNearestTimeIndex(times, String(item.time || ""));
+      if (index >= 0) {
+        const existing = buckets.get(index);
+        buckets.set(index, existing == null ? Number(temp) : Math.max(existing, Number(temp)));
+      }
+    }
+    for (const [index, temp] of buckets) {
+      hfPoints[index] = temp;
+      hasHfData = true;
+    }
+  }
+
   const mgmPoints = new Array(times.length).fill(null);
   if (
     !suppressAnkaraMgmObservation &&
@@ -882,6 +904,7 @@ export function getTemperatureChartData(
     ...airportMetarPoints.filter((value) => value != null),
     ...mgmPoints.filter((value) => value != null),
     ...mgmHourlyPoints.filter((value) => value != null),
+    ...hfPoints.filter((value) => value != null),
   ] as number[];
 
   if (!allValues.length) return null;
@@ -1137,6 +1160,7 @@ export function getTemperatureChartData(
   const mgmHourlySeries = buildSeriesPoints(times, mgmHourlyPoints);
   const metarSeries = buildObservationPoints(observationSource);
   const airportMetarSeries = buildObservationPoints(airportMetarSource);
+  const hfSeries = hasHfData ? buildSeriesPoints(times, hfPoints) : [];
   const mgmSeries =
     !suppressAnkaraMgmObservation && detail.mgm?.temp != null && detail.mgm?.time
       ? buildObservationPoints([{ time: detail.mgm.time, temp: detail.mgm.temp }])
@@ -1167,6 +1191,59 @@ export function getTemperatureChartData(
   const xMin = times.length ? hmToMinutes(times[0]) ?? 0 : 0;
   const xMax = times.length ? hmToMinutes(times[times.length - 1]) ?? 24 * 60 : 24 * 60;
 
+  // HF legend
+  if (hasHfData && detail.hf_source) {
+    const hfIcao = detail.hf_source.icao || "ASOS";
+    const hfCount = detail.hf_source.observation_count || 0;
+    const hfPeak = detail.hf_peak_detection;
+    const hfSrcKind = detail.hf_source.source_kind || detail.hf_source.kind;
+    const hfSpeci = detail.hf_source.speci_count || 0;
+    const hfPrecise = detail.hf_source.precise_count || 0;
+    const hfGap = detail.hf_source.median_gap_minutes;
+    const sourceLabel =
+      hfSrcKind === "asos_1min"
+        ? isEnglish(locale)
+          ? "1-min ASOS"
+          : "1分钟 ASOS"
+        : hfSrcKind === "wgov_5min"
+          ? isEnglish(locale)
+            ? "5-min weather.gov"
+            : "5分钟 weather.gov"
+          : isEnglish(locale)
+            ? "HF METAR/SPECI"
+            : "高频 METAR/SPECI";
+    if (hfPeak && hfPeak.status === "post_peak") {
+      legendParts.push(
+        isEnglish(locale)
+          ? `${sourceLabel} [${hfIcao}]: peak ${hfPeak.peak_time || "--"} (${detail.hf_source.max_temp}${detail.temp_symbol}), now -${hfPeak.decline_from_peak_f ?? hfPeak.decline_from_peak_c ?? 0}${detail.temp_symbol} [${Math.round((hfPeak.confidence ?? 0) * 100)}% conf]`
+          : `${sourceLabel} [${hfIcao}]: 峰值 ${hfPeak.peak_time || "--"} (${detail.hf_source.max_temp}${detail.temp_symbol}), 已下降 ${hfPeak.decline_from_peak_f ?? hfPeak.decline_from_peak_c ?? 0}${detail.temp_symbol} [置信度 ${Math.round((hfPeak.confidence ?? 0) * 100)}%]`,
+      );
+    } else if (hfCount > 0) {
+      const extraBits: string[] = [];
+      if (hfGap != null) {
+        extraBits.push(
+          isEnglish(locale)
+            ? `~${hfGap}min cadence`
+            : `~${hfGap}分钟间隔`,
+        );
+      }
+      if (hfSpeci > 0) {
+        extraBits.push(isEnglish(locale) ? `${hfSpeci} SPECI` : `${hfSpeci} 特报`);
+      }
+      if (hfPrecise > 0 && hfSrcKind !== "asos_1min") {
+        extraBits.push(
+          isEnglish(locale) ? `${hfPrecise} at 0.1°C` : `${hfPrecise} 个 0.1°C`,
+        );
+      }
+      const extraStr = extraBits.length > 0 ? ` (${extraBits.join(", ")})` : "";
+      legendParts.push(
+        isEnglish(locale)
+          ? `${sourceLabel} [${hfIcao}]: ${hfCount} obs${extraStr}, latest ${detail.hf_source.latest_temp}${detail.temp_symbol}@${detail.hf_source.latest_time || "--"}`
+          : `${sourceLabel} [${hfIcao}]: ${hfCount} 个观测${extraStr}, 最新 ${detail.hf_source.latest_temp}${detail.temp_symbol}@${detail.hf_source.latest_time || "--"}`,
+      );
+    }
+  }
+
   return {
     datasets: {
       airportMetarPoints,
@@ -1176,6 +1253,9 @@ export function getTemperatureChartData(
       debPast,
       debPastSeries,
       hasMgmHourly,
+      hasHfData,
+      hfPoints,
+      hfSeries,
       metarPoints,
       metarSeries,
       mgmHourlyPoints,

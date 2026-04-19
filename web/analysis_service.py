@@ -2362,6 +2362,54 @@ def _analyze(
         "ai_analysis": "",
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
+
+    # ── HF (high-frequency) temperature data ──
+    # Prefer ASOS 1-min (true minute data, US only, 1-2 day lag) over hf_intraday
+    # (METAR/SPECI-derived, worldwide, real-time, 0.1°C precision from T-group remarks).
+    _hf_use_f = city_meta.get("use_fahrenheit", False)
+    _hf_asos = raw.get("asos_1min")
+    _hf_intraday = raw.get("hf_intraday")
+    _hf_src_obj = None
+    _hf_src_kind = None
+    if isinstance(_hf_asos, dict) and _hf_asos.get("observations"):
+        _hf_src_obj = _hf_asos
+        _hf_src_kind = "asos_1min"
+    elif isinstance(_hf_intraday, dict) and _hf_intraday.get("observations"):
+        _hf_src_obj = _hf_intraday
+        _hf_src_kind = "hf_intraday"
+
+    if _hf_src_obj is not None:
+        _hf_obs = _hf_src_obj["observations"]
+        result["hf_today_obs"] = [
+            {
+                "time": o.get("local_time"),
+                "temp": (o.get("temp_f") if _hf_use_f else o.get("temp_c")),
+                "is_speci": bool(o.get("is_speci")),
+                "precision": o.get("precision"),
+            }
+            for o in _hf_obs
+            if o.get("local_time")
+        ]
+        result["hf_peak_detection"] = sd.get("hf_peak_detection") if sd else None
+        result["hf_alpha"] = sd.get("hf_alpha") if sd else None
+        # source_kind gives finer detail than kind: 'wgov_5min' / 'awc_metar_speci' / etc.
+        _hf_source_kind = _hf_src_obj.get("source_kind") or _hf_src_kind
+        result["hf_source"] = {
+            "icao": _hf_src_obj.get("icao"),
+            "station": _hf_src_obj.get("station"),
+            "kind": _hf_src_kind,
+            "source_kind": _hf_source_kind,
+            "median_gap_minutes": _hf_src_obj.get("median_gap_minutes"),
+            "observation_count": _hf_src_obj.get("observation_count", 0),
+            "speci_count": _hf_src_obj.get("speci_count", 0),
+            "precise_count": _hf_src_obj.get("precise_count", 0),
+            "max_temp": _hf_src_obj.get("max_temp"),
+            "max_temp_time": _hf_src_obj.get("max_temp_time"),
+            "latest_temp": _hf_src_obj.get("latest_temp"),
+            "latest_time": _hf_src_obj.get("latest_time"),
+            "latest_is_speci": _hf_src_obj.get("latest_is_speci", False),
+            "latest_precision": _hf_src_obj.get("latest_precision"),
+        }
     result["intraday_meteorology"] = _build_intraday_meteorology(result)
 
     if include_llm_commentary:

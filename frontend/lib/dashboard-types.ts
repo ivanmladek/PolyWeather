@@ -518,6 +518,72 @@ export interface CityDetail {
   source_forecasts?: SourceForecasts;
   market_scan?: MarketScan;
   intraday_meteorology?: IntradayMeteorology;
+  /** High-frequency intraday observation points (ASOS 1-min or METAR/SPECI-derived) */
+  hf_today_obs?: Array<{
+    time?: string;
+    temp?: number | null;
+    is_speci?: boolean;
+    precision?: string;
+  }>;
+  /** HF peak detection result */
+  hf_peak_detection?: HFPeakDetection | null;
+  /** HF alpha signal summary */
+  hf_alpha?: HFAlphaSummary | null;
+  /** HF data source metadata */
+  hf_source?: {
+    icao?: string;
+    station?: string;
+    /** 'asos_1min' (true 1-min, US only) or 'hf_intraday' (wgov 5-min / AWC METAR) */
+    kind?: "asos_1min" | "hf_intraday" | string;
+    /** Finer-grained source: 'wgov_5min' | 'awc_metar_speci' */
+    source_kind?: "asos_1min" | "wgov_5min" | "awc_metar_speci" | string;
+    /** Median gap between consecutive observations, in minutes */
+    median_gap_minutes?: number | null;
+    observation_count?: number;
+    speci_count?: number;
+    precise_count?: number;
+    max_temp?: number | null;
+    max_temp_time?: string | null;
+    latest_temp?: number | null;
+    latest_time?: string | null;
+    latest_is_speci?: boolean;
+    latest_precision?: string | null;
+  };
+}
+
+export interface HFPeakDetection {
+  status?: "pre_peak" | "at_peak" | "post_peak" | "uncertain" | "insufficient_data" | string;
+  confidence?: number;
+  peak_temp_f?: number | null;
+  peak_temp_c?: number | null;
+  peak_time?: string | null;
+  minutes_since_peak?: number | null;
+  current_temp_f?: number | null;
+  current_temp_c?: number | null;
+  decline_from_peak_f?: number | null;
+  decline_from_peak_c?: number | null;
+  hf_trend_slope_per_min?: number | null;
+  hf_trend_direction?: string | null;
+  alpha_signal?: "strong_post_peak" | "likely_post_peak" | "possible_post_peak" | "none" | string;
+  alpha_minutes_ahead?: number | null;
+  evidence?: string[];
+  observation_count?: number;
+  max_temp_f?: number | null;
+  latest_temp_f?: number | null;
+}
+
+export interface HFAlphaSummary {
+  has_alpha?: boolean;
+  alpha_type?: string;
+  alpha_confidence?: number;
+  alpha_minutes?: number;
+  market_implication?: string;
+  hf_status?: string;
+  metar_status?: string;
+  hf_confidence?: number;
+  peak_temp?: number | null;
+  current_temp?: number | null;
+  decline?: number | null;
 }
 
 export interface HistoryPoint {

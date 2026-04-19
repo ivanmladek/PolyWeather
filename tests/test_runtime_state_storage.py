@@ -3,6 +3,7 @@ import time
 
 from src.database.runtime_state import (
     DailyRecordRepository,
+    HFTemperatureRepository,
     OpenMeteoCacheRepository,
     ProbabilitySnapshotRepository,
     RuntimeStateDB,
@@ -136,3 +137,47 @@ def test_training_feature_record_repository_roundtrip(tmp_path, monkeypatch):
     loaded = repo.get_record('ankara', '2026-03-20')
     assert loaded['forecasts']['ECMWF'] == 12.3
     assert loaded['deb_prediction'] == 12.1
+
+
+def test_hf_temperature_repository_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setenv('POLYWEATHER_DB_PATH', str(tmp_path / 'polyweather.db'))
+    db = RuntimeStateDB(str(tmp_path / 'polyweather.db'))
+    repo = HFTemperatureRepository(db)
+
+    observations = [
+        {"utc_time": "2026-04-19T14:01:00Z", "local_time": "09:01", "temp_f": 78.1, "temp_c": 25.6, "dwp_f": 55.0, "dwp_c": 12.8},
+        {"utc_time": "2026-04-19T14:02:00Z", "local_time": "09:02", "temp_f": 78.3, "temp_c": 25.7, "dwp_f": 55.1, "dwp_c": 12.8},
+        {"utc_time": "2026-04-19T14:03:00Z", "local_time": "09:03", "temp_f": 78.5, "temp_c": 25.8, "dwp_f": 55.2, "dwp_c": 12.9},
+    ]
+
+    count = repo.bulk_upsert_observations(icao="KLGA", target_date="2026-04-19", observations=observations)
+    assert count == 3
+
+    loaded = repo.load_observations(icao="KLGA", target_date="2026-04-19")
+    assert len(loaded) == 3
+    assert loaded[0]["temp_f"] == 78.1
+    assert loaded[2]["temp_f"] == 78.5
+
+    # Test peak detection persistence
+    peak_result = {
+        "status": "post_peak",
+        "confidence": 0.75,
+        "peak_temp_f": 85.0,
+        "peak_temp_c": 29.4,
+        "peak_time": "14:30",
+        "alpha_signal": "strong_post_peak",
+        "alpha_minutes_ahead": 25,
+        "observation_count": 120,
+    }
+    repo.upsert_peak_detection(icao="KLGA", target_date="2026-04-19", result_dict=peak_result)
+    loaded_peak = repo.load_peak_detection(icao="KLGA", target_date="2026-04-19")
+    assert loaded_peak is not None
+    assert loaded_peak["status"] == "post_peak"
+    assert loaded_peak["confidence"] == 0.75
+    assert loaded_peak["alpha_signal"] == "strong_post_peak"
+
+    # Test overwrite
+    peak_result["confidence"] = 0.85
+    repo.upsert_peak_detection(icao="KLGA", target_date="2026-04-19", result_dict=peak_result)
+    loaded_peak2 = repo.load_peak_detection(icao="KLGA", target_date="2026-04-19")
+    assert loaded_peak2["confidence"] == 0.85

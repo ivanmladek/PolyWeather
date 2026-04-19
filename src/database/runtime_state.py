@@ -209,6 +209,50 @@ class RuntimeStateDB:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_official_intraday_obs_station_date ON official_intraday_observations_store(source_code, station_code, target_date, observation_time)"
             )
+            # High-frequency (1-minute) temperature observations from ASOS stations
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS hf_temperature_observations (
+                    icao TEXT NOT NULL,
+                    target_date TEXT NOT NULL,
+                    observation_time_utc TEXT NOT NULL,
+                    observation_time_local TEXT NOT NULL,
+                    temp_f REAL NOT NULL,
+                    temp_c REAL NOT NULL,
+                    dwp_f REAL,
+                    dwp_c REAL,
+                    source TEXT NOT NULL DEFAULT 'asos_1min',
+                    ingested_at REAL NOT NULL,
+                    PRIMARY KEY (icao, observation_time_utc)
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_hf_temp_obs_icao_date ON hf_temperature_observations(icao, target_date, observation_time_utc)"
+            )
+            # Peak detection results (one per city per day, updated as new data arrives)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS hf_peak_detection_log (
+                    icao TEXT NOT NULL,
+                    target_date TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    status TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    peak_temp_f REAL,
+                    peak_temp_c REAL,
+                    peak_time TEXT,
+                    alpha_signal TEXT,
+                    alpha_minutes_ahead INTEGER,
+                    observation_count INTEGER,
+                    payload_json TEXT NOT NULL,
+                    PRIMARY KEY (icao, target_date)
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_hf_peak_log_icao_date ON hf_peak_detection_log(icao, target_date)"
+            )
             conn.commit()
 
 
@@ -1015,6 +1059,159 @@ def _top_bucket(snapshot: Optional[List[Dict[str, Any]]]) -> Optional[int]:
             best_prob = fprob
             best_value = ivalue
     return best_value
+
+
+class HFTemperatureRepository:
+    """Repository for high-frequency (1-minute) temperature observations and peak detection logs."""
+
+    def __init__(self, db: Optional[RuntimeStateDB] = None):
+        self.db = db or RuntimeStateDB.instance()
+
+    def bulk_upsert_observations(
+        self,
+        *,
+        icao: str,
+        target_date: str,
+        observations: List[Dict[str, Any]],
+        source: str = "asos_1min",
+    ) -> int:
+        """Bulk insert/update 1-minute observations. Returns count of rows upserted."""
+        if not observations:
+            return 0
+        ingested_at = time.time()
+        count = 0
+        with self.db.connect() as conn:
+            for obs in observations:
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO hf_temperature_observations (
+                            icao, target_date, observation_time_utc, observation_time_local,
+                            temp_f, temp_c, dwp_f, dwp_c, source, ingested_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(icao, observation_time_utc) DO UPDATE SET
+                            temp_f = excluded.temp_f,
+                            temp_c = excluded.temp_c,
+                            dwp_f = excluded.dwp_f,
+                            dwp_c = excluded.dwp_c,
+                            ingested_at = excluded.ingested_at
+                        """,
+                        (
+                            icao,
+                            target_date,
+                            str(obs.get("utc_time", "")),
+                            str(obs.get("local_time", "")),
+                            float(obs["temp_f"]),
+                            float(obs["temp_c"]),
+                            float(obs["dwp_f"]) if obs.get("dwp_f") is not None else None,
+                            float(obs["dwp_c"]) if obs.get("dwp_c") is not None else None,
+                            source,
+                            ingested_at,
+                        ),
+                    )
+                    count += 1
+                except Exception:
+                    continue
+            conn.commit()
+        return count
+
+    def load_observations(
+        self,
+        *,
+        icao: str,
+        target_date: str,
+    ) -> List[Dict[str, Any]]:
+        """Load all HF observations for a station+date, sorted by time."""
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT observation_time_utc, observation_time_local, temp_f, temp_c, dwp_f, dwp_c
+                FROM hf_temperature_observations
+                WHERE icao = ? AND target_date = ?
+                ORDER BY observation_time_utc
+                """,
+                (icao, target_date),
+            ).fetchall()
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            out.append({
+                "utc_time": str(row["observation_time_utc"]),
+                "local_time": str(row["observation_time_local"]),
+                "temp_f": float(row["temp_f"]),
+                "temp_c": float(row["temp_c"]),
+                "dwp_f": float(row["dwp_f"]) if row["dwp_f"] is not None else None,
+                "dwp_c": float(row["dwp_c"]) if row["dwp_c"] is not None else None,
+            })
+        return out
+
+    def upsert_peak_detection(
+        self,
+        *,
+        icao: str,
+        target_date: str,
+        result_dict: Dict[str, Any],
+    ) -> None:
+        """Save/update peak detection result for a station+date."""
+        updated_at = time.time()
+        payload_json = json.dumps(result_dict, ensure_ascii=False)
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO hf_peak_detection_log (
+                    icao, target_date, updated_at, status, confidence,
+                    peak_temp_f, peak_temp_c, peak_time, alpha_signal,
+                    alpha_minutes_ahead, observation_count, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(icao, target_date) DO UPDATE SET
+                    updated_at = excluded.updated_at,
+                    status = excluded.status,
+                    confidence = excluded.confidence,
+                    peak_temp_f = excluded.peak_temp_f,
+                    peak_temp_c = excluded.peak_temp_c,
+                    peak_time = excluded.peak_time,
+                    alpha_signal = excluded.alpha_signal,
+                    alpha_minutes_ahead = excluded.alpha_minutes_ahead,
+                    observation_count = excluded.observation_count,
+                    payload_json = excluded.payload_json
+                """,
+                (
+                    icao,
+                    target_date,
+                    updated_at,
+                    result_dict.get("status", ""),
+                    float(result_dict.get("confidence", 0.0)),
+                    result_dict.get("peak_temp_f"),
+                    result_dict.get("peak_temp_c"),
+                    result_dict.get("peak_time"),
+                    result_dict.get("alpha_signal"),
+                    result_dict.get("alpha_minutes_ahead"),
+                    result_dict.get("observation_count"),
+                    payload_json,
+                ),
+            )
+            conn.commit()
+
+    def load_peak_detection(
+        self,
+        *,
+        icao: str,
+        target_date: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Load the latest peak detection result for a station+date."""
+        with self.db.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT payload_json FROM hf_peak_detection_log
+                WHERE icao = ? AND target_date = ?
+                """,
+                (icao, target_date),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            return json.loads(row["payload_json"])
+        except Exception:
+            return None
 
 
 def get_runtime_data_dir() -> str:

@@ -384,6 +384,34 @@ function DailyTemperatureChart({ dateStr }: { dateStr: string }) {
         });
       }
 
+      // HF temperature observations (true 1-min ASOS / 5-min weather.gov / hourly METAR+SPECI)
+      if (todayChartData.datasets.hasHfData && todayChartData.datasets.hfSeries?.length > 0) {
+        const hfSrcKind = detail.hf_source?.source_kind || detail.hf_source?.kind;
+        const hfLabel =
+          hfSrcKind === "asos_1min"
+            ? locale === "en-US" ? "1-min ASOS" : "1分钟 ASOS"
+            : hfSrcKind === "wgov_5min"
+              ? locale === "en-US" ? "5-min weather.gov" : "5分钟 weather.gov"
+              : locale === "en-US" ? "HF METAR/SPECI" : "高频 METAR/SPECI";
+        // Finer-resolution sources get smaller point radius for cleaner visuals
+        const pointRadius = hfSrcKind === "asos_1min" ? 1.5 : hfSrcKind === "wgov_5min" ? 2 : 3;
+        datasets.push({
+          backgroundColor: "rgba(251, 146, 60, 0.12)",
+          borderColor: "rgba(251, 146, 60, 0.85)",
+          borderWidth: 1.5,
+          data: todayChartData.datasets.hfSeries,
+          fill: false,
+          label: hfLabel,
+          order: -1,
+          parsing: false,
+          pointHoverRadius: 5,
+          pointRadius,
+          showLine: true,
+          spanGaps: true,
+          tension: 0.2,
+        });
+      }
+
       if (todayChartData.datasets.mgmSeries?.length > 0) {
         datasets.push({
           backgroundColor: "#facc15",
@@ -885,6 +913,82 @@ export function FutureForecastModal() {
       value: `${delta > 0 ? "+" : ""}${delta.toFixed(1)}${detail.temp_symbol}`,
     };
   }, [detail.airport_vs_network_delta, detail.network_lead_signal, detail.temp_symbol, isToday, locale, showDeferredTodaySections]);
+  const hfAlphaView = useMemo(() => {
+    if (!showDeferredTodaySections) return null;
+    if (!isToday) return null;
+    const hfPeak = detail.hf_peak_detection;
+    const hfAlpha = detail.hf_alpha;
+    const hfSource = detail.hf_source;
+    if (!hfSource || hfSource.observation_count === 0) return null;
+    const icao = hfSource.icao || "ASOS";
+    const hfSrcKind = hfSource.source_kind || hfSource.kind;
+    const sourceLabel =
+      hfSrcKind === "asos_1min"
+        ? locale === "en-US" ? "1-min ASOS" : "1分钟 ASOS"
+        : hfSrcKind === "wgov_5min"
+          ? locale === "en-US" ? "5-min weather.gov" : "5分钟 weather.gov"
+          : locale === "en-US" ? "HF METAR/SPECI" : "高频 METAR/SPECI";
+    const latestTemp = hfSource.latest_temp;
+    const peakTemp = hfSource.max_temp;
+    const conf = Math.round(((hfPeak?.confidence) ?? 0) * 100);
+    let status: string;
+    let tone: "amber" | "blue" | "cyan" = "blue";
+
+    if (hfPeak?.status === "post_peak") {
+      status = locale === "en-US" ? "Post-peak confirmed" : "已确认过峰值";
+      tone = "cyan";
+    } else if (hfPeak?.status === "at_peak") {
+      status = locale === "en-US" ? "At/near peak" : "接近峰值";
+      tone = "amber";
+    } else if (hfPeak?.status === "pre_peak") {
+      status = locale === "en-US" ? "Still rising" : "仍在升温";
+      tone = "blue";
+    } else {
+      // No peak detection yet (not enough observations) — still show the HF feed
+      status =
+        (hfSource.speci_count || 0) > 0
+          ? locale === "en-US"
+            ? `SPECI-enhanced feed`
+            : "特报增强信号"
+          : locale === "en-US"
+            ? "Live feed"
+            : "实时信号";
+      tone = "blue";
+    }
+
+    const isEn = locale === "en-US";
+    const specifierBits: string[] = [];
+    if (hfSource.median_gap_minutes != null) {
+      specifierBits.push(isEn ? `~${hfSource.median_gap_minutes}min cadence` : `~${hfSource.median_gap_minutes}分钟间隔`);
+    }
+    if ((hfSource.speci_count || 0) > 0) {
+      specifierBits.push(isEn ? `${hfSource.speci_count} SPECI` : `${hfSource.speci_count} 特报`);
+    }
+    if ((hfSource.precise_count || 0) > 0 && hfSrcKind !== "asos_1min") {
+      specifierBits.push(isEn ? `${hfSource.precise_count} at 0.1°C` : `${hfSource.precise_count} 个 0.1°C`);
+    }
+    const specifiersStr = specifierBits.length > 0 ? ` (${specifierBits.join(", ")})` : "";
+
+    const decline = hfPeak?.decline_from_peak_f ?? hfPeak?.decline_from_peak_c ?? 0;
+    const note =
+      hfPeak?.status === "post_peak"
+        ? locale === "en-US"
+          ? `${sourceLabel} [${icao}]: peaked at ${hfPeak.peak_time || "--"} (${peakTemp}${detail.temp_symbol}), now ${latestTemp}${detail.temp_symbol} (-${typeof decline === "number" ? decline.toFixed(1) : decline}). ${hfAlpha?.has_alpha ? `Alpha: ${hfAlpha.alpha_minutes || 0}min ahead of next METAR.` : ""}`
+          : `${sourceLabel} [${icao}]: 峰值 ${hfPeak.peak_time || "--"} (${peakTemp}${detail.temp_symbol}), 当前 ${latestTemp}${detail.temp_symbol} (-${typeof decline === "number" ? decline.toFixed(1) : decline}). ${hfAlpha?.has_alpha ? `领先下次 METAR ${hfAlpha.alpha_minutes || 0} 分钟。` : ""}`
+        : locale === "en-US"
+          ? `${sourceLabel} [${icao}]: ${hfSource.observation_count} obs${specifiersStr}, latest ${latestTemp}${detail.temp_symbol}@${hfSource.latest_time || "--"}${hfPeak ? `, conf ${conf}%` : ""}.`
+          : `${sourceLabel} [${icao}]: ${hfSource.observation_count} 个观测${specifiersStr}, 最新 ${latestTemp}${detail.temp_symbol}@${hfSource.latest_time || "--"}${hfPeak ? `, 置信度 ${conf}%` : ""}。`;
+    return {
+      label: locale === "en-US" ? `HF peak (${sourceLabel})` : `高频峰值（${sourceLabel}）`,
+      note,
+      status,
+      tone,
+      value:
+        hfPeak?.status === "post_peak"
+          ? `${hfPeak.peak_time || "--"} (${peakTemp}${detail.temp_symbol})`
+          : `${latestTemp}${detail.temp_symbol}@${hfSource.latest_time || "--"}`,
+    };
+  }, [detail.hf_alpha, detail.hf_peak_detection, detail.hf_source, detail.temp_symbol, isToday, locale, showDeferredTodaySections]);
   const isNoaaSettlement =
     detail.current?.settlement_source === "noaa" ||
     detail.current?.settlement_source_label === "NOAA";
@@ -1677,7 +1781,7 @@ export function FutureForecastModal() {
                         </div>
                       </div>
                       <div className="future-v2-pace-signal-grid">
-                        {[boundaryRiskView, peakWindowStateView, networkLeadView]
+                        {[boundaryRiskView, peakWindowStateView, networkLeadView, hfAlphaView]
                           .filter((item) => item != null)
                           .map((item) => (
                             <div key={item.label} className="future-v2-pace-signal-card">

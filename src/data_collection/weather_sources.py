@@ -15,9 +15,12 @@ from src.data_collection.jma_amedas_sources import JmaAmedasSourceMixin
 from src.data_collection.russia_station_sources import RussiaStationSourceMixin
 from src.data_collection.nmc_sources import NmcSourceMixin
 from src.data_collection.nws_open_meteo_sources import NwsOpenMeteoSourceMixin
+from src.data_collection.asos_one_minute_sources import AsosOneMinuteSourceMixin
+from src.data_collection.awc_metar_cache_sources import AwcMetarCacheSourceMixin
+from src.data_collection.hf_intraday_sources import HFIntradaySourceMixin
 
 
-class WeatherDataCollector(OpenMeteoCacheMixin, SettlementSourceMixin, MetarSourceMixin, MgmSourceMixin, KmaStationSourceMixin, JmaAmedasSourceMixin, RussiaStationSourceMixin, NmcSourceMixin, NwsOpenMeteoSourceMixin):
+class WeatherDataCollector(OpenMeteoCacheMixin, SettlementSourceMixin, MetarSourceMixin, MgmSourceMixin, KmaStationSourceMixin, JmaAmedasSourceMixin, RussiaStationSourceMixin, NmcSourceMixin, NwsOpenMeteoSourceMixin, AsosOneMinuteSourceMixin, AwcMetarCacheSourceMixin, HFIntradaySourceMixin):
     """
     Multi-source weather data collector
 
@@ -227,6 +230,39 @@ class WeatherDataCollector(OpenMeteoCacheMixin, SettlementSourceMixin, MetarSour
             or os.getenv("CWA_OPEN_DATA_API_KEY")
             or "rdec-key-123-45678-011121314"
         ).strip()
+
+        # ASOS 1-minute high-frequency temperature data (US aerodromes)
+        self.asos_1min_cache_ttl_sec = int(
+            os.getenv("ASOS_1MIN_CACHE_TTL_SEC", "60")  # refresh every minute
+        )
+        self.asos_1min_timeout_sec = max(
+            2.0, float(os.getenv("ASOS_1MIN_TIMEOUT_SEC", "6"))
+        )
+        self._asos_1min_cache: Dict[str, Dict] = {}
+        self._asos_1min_cache_lock = threading.Lock()
+        self.hf_temperature_enabled = os.getenv(
+            "POLYWEATHER_HF_TEMPERATURE_ENABLED", "true"
+        ).strip().lower() in ("1", "true", "yes")
+
+        # AWC METAR cache for worldwide SPECI-enhanced observations
+        self.awc_metar_cache_ttl_sec = int(
+            os.getenv("AWC_METAR_CACHE_TTL_SEC", "60")
+        )
+        self.awc_cache_timeout_sec = max(
+            2.0, float(os.getenv("AWC_METAR_CACHE_TIMEOUT_SEC", "4"))
+        )
+        self._awc_metar_cache: Dict[str, Dict] = {}
+        self._awc_metar_cache_lock = threading.Lock()
+
+        # HF intraday (real-time METAR/SPECI-based high-frequency temperature)
+        self.hf_intraday_cache_ttl_sec = int(
+            os.getenv("HF_INTRADAY_CACHE_TTL_SEC", "60")
+        )
+        self.hf_intraday_timeout_sec = max(
+            2.0, float(os.getenv("HF_INTRADAY_TIMEOUT_SEC", "5"))
+        )
+        self._hf_intraday_cache: Dict[str, Dict] = {}
+        self._hf_intraday_cache_lock = threading.Lock()
 
         # 磁盘持久化缓存：重启后即可加载上次的预报数据，避免冷启动请求爆发
         self._disk_cache_path = os.getenv(
@@ -999,6 +1035,26 @@ class WeatherDataCollector(OpenMeteoCacheMixin, SettlementSourceMixin, MetarSour
                     if taf_data:
                         results["taf"] = taf_data
 
+                # ASOS 1-minute high-frequency temperature data (US aerodromes, 1-2 day lag)
+                if self.hf_temperature_enabled and self._is_asos_1min_eligible(city_lower):
+                    asos_1min_data = self.fetch_asos_1min(
+                        city_lower, use_fahrenheit=use_fahrenheit, utc_offset=utc_offset
+                    )
+                    if asos_1min_data:
+                        results["asos_1min"] = asos_1min_data
+
+                # HF intraday (real-time METAR/SPECI with 0.1°C T-group precision, worldwide)
+                icao_for_hf = self.CITY_REGISTRY.get(city_lower, {}).get("icao")
+                if self.hf_temperature_enabled and icao_for_hf and supports_aviationweather:
+                    hf_intraday_data = self.fetch_hf_intraday(
+                        city_lower,
+                        icao=icao_for_hf,
+                        use_fahrenheit=use_fahrenheit,
+                        utc_offset=utc_offset,
+                    )
+                    if hf_intraday_data:
+                        results["hf_intraday"] = hf_intraday_data
+
                 self._attach_turkish_mgm_data(
                     results,
                     city_lower,
@@ -1041,6 +1097,26 @@ class WeatherDataCollector(OpenMeteoCacheMixin, SettlementSourceMixin, MetarSour
                     if taf_data:
                         results["taf"] = taf_data
 
+                # ASOS 1-minute high-frequency temperature data (US aerodromes, 1-2 day lag)
+                if self.hf_temperature_enabled and self._is_asos_1min_eligible(city_lower):
+                    asos_1min_data = self.fetch_asos_1min(
+                        city_lower, use_fahrenheit=use_fahrenheit, utc_offset=fallback_utc_offset
+                    )
+                    if asos_1min_data:
+                        results["asos_1min"] = asos_1min_data
+
+                # HF intraday (real-time METAR/SPECI, worldwide)
+                icao_for_hf = self.CITY_REGISTRY.get(city_lower, {}).get("icao")
+                if self.hf_temperature_enabled and icao_for_hf and supports_aviationweather:
+                    hf_intraday_data = self.fetch_hf_intraday(
+                        city_lower,
+                        icao=icao_for_hf,
+                        use_fahrenheit=use_fahrenheit,
+                        utc_offset=fallback_utc_offset,
+                    )
+                    if hf_intraday_data:
+                        results["hf_intraday"] = hf_intraday_data
+
                 self._attach_turkish_mgm_data(
                     results,
                     city_lower,
@@ -1075,6 +1151,29 @@ class WeatherDataCollector(OpenMeteoCacheMixin, SettlementSourceMixin, MetarSour
                 taf_data = self.fetch_taf(city)
                 if taf_data:
                     results["taf"] = taf_data
+
+            # ASOS 1-minute high-frequency temperature data (US aerodromes, 1-2 day lag)
+            fallback_utc_offset = int(
+                self.CITY_REGISTRY.get(city_lower, {}).get("tz_offset", 0)
+            )
+            if self.hf_temperature_enabled and self._is_asos_1min_eligible(city_lower):
+                asos_1min_data = self.fetch_asos_1min(
+                    city_lower, use_fahrenheit=use_fahrenheit, utc_offset=fallback_utc_offset
+                )
+                if asos_1min_data:
+                    results["asos_1min"] = asos_1min_data
+
+            # HF intraday (real-time METAR/SPECI, worldwide)
+            icao_for_hf = self.CITY_REGISTRY.get(city_lower, {}).get("icao")
+            if self.hf_temperature_enabled and icao_for_hf and supports_aviationweather:
+                hf_intraday_data = self.fetch_hf_intraday(
+                    city_lower,
+                    icao=icao_for_hf,
+                    use_fahrenheit=use_fahrenheit,
+                    utc_offset=fallback_utc_offset,
+                )
+                if hf_intraday_data:
+                    results["hf_intraday"] = hf_intraday_data
 
         return results
 

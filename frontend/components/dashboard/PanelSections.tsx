@@ -488,6 +488,32 @@ export function TemperatureChart() {
       });
     }
 
+    // HF temperature observations (true 1-min ASOS / 5-min weather.gov / hourly METAR+SPECI)
+    if (chartData.datasets.hasHfData && chartData.datasets.hfPoints.some((value: unknown) => value != null)) {
+      const hfSrcKind = data.hf_source?.source_kind || data.hf_source?.kind;
+      const hfLabel =
+        hfSrcKind === "asos_1min"
+          ? locale === "en-US" ? "1-min ASOS" : "1分钟 ASOS"
+          : hfSrcKind === "wgov_5min"
+            ? locale === "en-US" ? "5-min weather.gov" : "5分钟 weather.gov"
+            : locale === "en-US" ? "HF METAR/SPECI" : "高频 METAR/SPECI";
+      const pointRadius = hfSrcKind === "asos_1min" ? 1 : hfSrcKind === "wgov_5min" ? 1.5 : 3;
+      datasets.push({
+        backgroundColor: "rgba(251, 146, 60, 0.08)",
+        borderColor: "rgba(251, 146, 60, 0.85)",
+        borderWidth: 1.5,
+        data: chartData.datasets.hfPoints,
+        fill: false,
+        label: hfLabel,
+        order: -1,
+        pointHoverRadius: 4,
+        pointRadius,
+        showLine: true,
+        spanGaps: true,
+        tension: 0.2,
+      });
+    }
+
     if (
       !chartData.datasets.hasMgmHourly &&
       Math.abs(chartData.datasets.offset) > 0.3

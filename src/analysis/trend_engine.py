@@ -15,6 +15,11 @@ from src.analysis.deb_algorithm import (
     update_daily_record,
     _is_excluded_model_name,
 )
+from src.analysis.hf_peak_detection import (
+    detect_peak,
+    compute_hf_alpha_summary,
+    PeakDetectionResult,
+)
 from src.analysis.probability_calibration import (
     apply_probability_calibration,
     build_probability_features,
@@ -411,13 +416,123 @@ def analyze_weather_trend(
     else:
         first_peak_h, last_peak_h = 13, 15
 
-    # Peak status
+    # Peak status (METAR-based, from Open-Meteo hourly profile)
     if local_hour_frac > last_peak_h:
         peak_status = "past"
     elif first_peak_h <= local_hour_frac <= last_peak_h:
         peak_status = "in_window"
     else:
         peak_status = "before"
+
+    # === HF Peak Detection (real-time METAR/SPECI + ASOS 1-min where available) ===
+    hf_peak_result: Optional[PeakDetectionResult] = None
+    hf_alpha_summary: Optional[Dict] = None
+    hf_source_name = None
+    hf_source_icao = None
+
+    # Prefer ASOS 1-min (truly minute-by-minute, US only, 1-2 day lag)
+    asos_1min = weather_data.get("asos_1min")
+    hf_intraday = weather_data.get("hf_intraday")
+
+    hf_observations = []
+    if asos_1min and isinstance(asos_1min, dict) and asos_1min.get("observations"):
+        hf_observations = asos_1min.get("observations", [])
+        hf_source_name = "asos_1min"
+        hf_source_icao = asos_1min.get("icao", "")
+    elif hf_intraday and isinstance(hf_intraday, dict) and hf_intraday.get("observations"):
+        hf_observations = hf_intraday.get("observations", [])
+        hf_source_name = "hf_intraday"
+        hf_source_icao = hf_intraday.get("icao", "")
+
+    if hf_observations:
+        # Threshold by source: true 1-min ASOS (100s of obs) vs weather.gov 5-min
+        # (dozens of obs) vs AWC METAR/SPECI (few obs). Lower threshold = allow
+        # peak detection at lower density.
+        if hf_source_name == "asos_1min":
+            effective_min = 30
+        elif hf_intraday and isinstance(hf_intraday, dict) and hf_intraday.get("source_kind") == "wgov_5min":
+            effective_min = 10  # ~50 min of 5-min data
+        else:
+            effective_min = 4  # hourly METAR fallback
+
+        if len(hf_observations) >= effective_min:
+            try:
+                # Temporarily loosen the min observations for METAR-derived data
+                import src.analysis.hf_peak_detection as _hfp
+                _original_min = _hfp.MIN_OBSERVATIONS
+                _hfp.MIN_OBSERVATIONS = effective_min
+                try:
+                    hf_peak_result = detect_peak(
+                        observations=hf_observations,
+                        expected_peak_start_hour=first_peak_h,
+                        expected_peak_end_hour=last_peak_h,
+                        local_hour_frac=local_hour_frac,
+                    )
+                finally:
+                    _hfp.MIN_OBSERVATIONS = _original_min
+
+                if hf_peak_result and hf_peak_result.status != "insufficient_data":
+                    hf_alpha_summary = compute_hf_alpha_summary(
+                        peak_result=hf_peak_result,
+                        metar_peak_status=peak_status,
+                        deb_prediction=deb_prediction,
+                        use_fahrenheit=use_fahrenheit,
+                    )
+                    # Determine if source is dense enough to override peak_status
+                    source_kind_inner = (
+                        (hf_intraday or {}).get("source_kind") if hf_source_name == "hf_intraday" else None
+                    )
+                    is_dense_hf = (
+                        hf_source_name == "asos_1min"
+                        or source_kind_inner == "wgov_5min"
+                    )
+                    if hf_source_name == "asos_1min":
+                        label = "1-min ASOS"
+                    elif source_kind_inner == "wgov_5min":
+                        label = "5-min weather.gov"
+                    else:
+                        label = "HF METAR/SPECI"
+                    # Override peak_status when backed by dense HF data (1-min or 5-min)
+                    if (
+                        is_dense_hf
+                        and hf_peak_result.status == "post_peak"
+                        and hf_peak_result.confidence >= 0.60
+                        and peak_status != "past"
+                    ):
+                        peak_status = "past"
+                        is_cooling = True
+                        hf_peak_temp = hf_peak_result.peak_temp_f if use_fahrenheit else hf_peak_result.peak_temp_c
+                        hf_decline = hf_peak_result.decline_from_peak_f if use_fahrenheit else hf_peak_result.decline_from_peak_c
+                        insights.append(
+                            f"<b>{label}</b> [{hf_source_icao}]: peak passed at "
+                            f"{hf_peak_result.peak_time} ({hf_peak_temp}{temp_symbol}), "
+                            f"now -{hf_decline}{temp_symbol} "
+                            f"[conf={hf_peak_result.confidence:.0%}]"
+                        )
+                        ai_features.append(
+                            f"HF ({hf_source_icao}) confirms post-peak: "
+                            f"peaked at {hf_peak_result.peak_time} ({hf_peak_temp}{temp_symbol}), "
+                            f"now declining {hf_decline}{temp_symbol}. "
+                            f"Confidence: {hf_peak_result.confidence:.0%}."
+                        )
+                    elif (
+                        is_dense_hf
+                        and hf_peak_result.status == "pre_peak"
+                        and hf_peak_result.confidence >= 0.50
+                        and peak_status == "past"
+                    ):
+                        insights.append(
+                            f"<b>{label}</b>: still rising "
+                            f"(slope={hf_peak_result.hf_trend_slope_per_min:.3f}{temp_symbol}/min)"
+                        )
+                        ai_features.append(
+                            f"HF data shows still RISING at "
+                            f"{hf_peak_result.hf_trend_slope_per_min:.3f}{temp_symbol}/min. "
+                            f"Secondary warming possible."
+                        )
+            except Exception as exc:
+                from loguru import logger
+                logger.debug(f"HF peak detection error: {exc}")
 
     if city_name and current_forecasts and deb_prediction is not None:
         lgbm_prediction, _ = predict_lgbm_daily_high(
@@ -955,6 +1070,9 @@ def analyze_weather_trend(
             "summary": dynamic_summary,
             "notes": dynamic_notes,
         },
+        # High-frequency (1-minute) peak detection data
+        "hf_peak_detection": hf_peak_result.to_dict() if hf_peak_result else None,
+        "hf_alpha": hf_alpha_summary,
     }
     display_str = "\n".join(insights) if insights else ""
     return display_str, "\n".join(ai_features), structured

@@ -1414,3 +1414,120 @@ async def city_market_scan(
         target_date,
     )
 
+
+# ---------------------------------------------------------------------------
+# HF Temperature (1-minute ASOS) Endpoints
+# ---------------------------------------------------------------------------
+
+@router.get("/api/city/{name}/hf-temperature")
+async def city_hf_temperature(request: Request, name: str):
+    """Fetch high-frequency (1-minute) temperature data for a US city.
+
+    Returns minute-by-minute observations from ASOS stations, peak detection
+    analysis, and alpha signals comparing HF data vs METAR-based peak status.
+    Only available for US cities with ASOS stations.
+    """
+    from web.core import _weather
+    from src.analysis.hf_peak_detection import detect_peak, compute_hf_alpha_summary
+
+    city = _normalize_city_or_404(name)
+    city_meta = CITY_REGISTRY.get(city, {})
+    use_fahrenheit = city_meta.get("use_fahrenheit", False)
+    utc_offset = int(city_meta.get("tz_offset", 0))
+
+    if not _weather._is_asos_1min_eligible(city):
+        raise HTTPException(
+            status_code=404,
+            detail=f"City '{city}' does not have ASOS 1-minute data. "
+                   f"Only US ASOS-equipped aerodromes are supported.",
+        )
+
+    def _fetch_hf():
+        asos_data = _weather.fetch_asos_1min(
+            city, use_fahrenheit=use_fahrenheit, utc_offset=utc_offset
+        )
+        if not asos_data:
+            return {"error": "No ASOS 1-minute data available", "city": city}
+
+        observations = asos_data.get("observations", [])
+
+        # Get peak window from Open-Meteo if available
+        from datetime import datetime, timezone, timedelta
+        now_utc = datetime.now(timezone.utc)
+        local_now = now_utc + timedelta(seconds=utc_offset)
+        local_hour_frac = local_now.hour + local_now.minute / 60
+
+        # Run peak detection
+        peak_result = detect_peak(
+            observations=observations,
+            expected_peak_start_hour=13,  # default; could be refined with OM data
+            expected_peak_end_hour=15,
+            local_hour_frac=local_hour_frac,
+        )
+
+        # Compute alpha summary (compare vs METAR-based peak status)
+        # For now use time-of-day based peak status as METAR reference
+        if local_hour_frac > 15:
+            metar_peak_status = "past"
+        elif 13 <= local_hour_frac <= 15:
+            metar_peak_status = "in_window"
+        else:
+            metar_peak_status = "before"
+
+        alpha_summary = compute_hf_alpha_summary(
+            peak_result=peak_result,
+            metar_peak_status=metar_peak_status,
+            use_fahrenheit=use_fahrenheit,
+        )
+
+        # Downsample observations for response (every 5 min for chart display)
+        chart_observations = observations[::5] if len(observations) > 100 else observations
+
+        return {
+            "city": city,
+            "icao": asos_data.get("icao"),
+            "station": asos_data.get("station"),
+            "unit": "fahrenheit" if use_fahrenheit else "celsius",
+            "observation_count": len(observations),
+            "max_temp": asos_data.get("max_temp"),
+            "max_temp_time": asos_data.get("max_temp_time"),
+            "latest_temp": asos_data.get("latest_temp"),
+            "latest_time": asos_data.get("latest_time"),
+            "peak_detection": peak_result.to_dict(),
+            "alpha": alpha_summary,
+            "chart_observations": [
+                {
+                    "time": o["local_time"],
+                    "temp": o["temp_f"] if use_fahrenheit else o["temp_c"],
+                }
+                for o in chart_observations
+            ],
+        }
+
+    return await run_in_threadpool(_fetch_hf)
+
+
+@router.get("/api/hf-temperature/eligible-cities")
+async def hf_temperature_eligible_cities(request: Request):
+    """List all cities eligible for high-frequency temperature data."""
+    from web.core import _weather
+
+    eligible = []
+    for city_key, icao in _weather.ASOS_1MIN_STATIONS.items():
+        city_meta = CITY_REGISTRY.get(city_key, {})
+        eligible.append({
+            "city": city_key,
+            "display_name": city_meta.get("display_name") or city_meta.get("name", city_key.title()),
+            "icao": icao,
+            "use_fahrenheit": city_meta.get("use_fahrenheit", False),
+            "cluster_stations": _weather.ASOS_1MIN_CLUSTER.get(city_key, [icao]),
+        })
+
+    return {
+        "eligible_cities": eligible,
+        "count": len(eligible),
+        "source": "ASOS 1-minute via IEM (Iowa Environmental Mesonet)",
+        "resolution": "1 minute",
+        "precision": "0.1°F",
+    }
+
