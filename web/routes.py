@@ -1565,15 +1565,21 @@ async def city_elim_scan(request: Request, name: str):
     hf_max = hf_data.get("max_temp") if hf_data else None
     hf_max_time = hf_data.get("max_temp_time") if hf_data else None
 
-    # 2. Market bucket ladder (180s cache)
+    # 2. Market bucket ladder — temporarily lower cache TTLs for freshest prices
     from datetime import datetime, timezone, timedelta
     now_utc = datetime.now(timezone.utc)
     local_now = now_utc + timedelta(seconds=utc_offset)
     local_date = local_now.strftime("%Y-%m-%d")
 
-    market_scan = _market_layer.build_market_scan(
-        city=city, target_date=local_date,
-    )
+    # Temporarily lower price cache to 5s for the elim-scan path
+    original_price_ttl = _market_layer.price_cache_ttl
+    _market_layer.price_cache_ttl = 5
+    try:
+        market_scan = _market_layer.build_market_scan(
+            city=city, target_date=local_date,
+        )
+    finally:
+        _market_layer.price_cache_ttl = original_price_ttl
     all_buckets = (market_scan or {}).get("all_buckets") or []
 
     # 3. Elimination analysis

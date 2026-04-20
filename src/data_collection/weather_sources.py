@@ -255,8 +255,10 @@ class WeatherDataCollector(OpenMeteoCacheMixin, SettlementSourceMixin, MetarSour
         self._awc_metar_cache_lock = threading.Lock()
 
         # HF intraday (real-time METAR/SPECI-based high-frequency temperature)
+        # 30s default: weather.gov updates every 5min, but we poll faster so
+        # elim-arb can detect crossings within one scan cycle.
         self.hf_intraday_cache_ttl_sec = int(
-            os.getenv("HF_INTRADAY_CACHE_TTL_SEC", "60")
+            os.getenv("HF_INTRADAY_CACHE_TTL_SEC", "30")
         )
         self.hf_intraday_timeout_sec = max(
             2.0, float(os.getenv("HF_INTRADAY_TIMEOUT_SEC", "5"))
