@@ -1462,17 +1462,24 @@ class PolymarketReadOnlyLayer:
                     no_sell = max(0.0, min(1.0, 1.0 - yes_sell))
 
                 market_slug = str(market.get("slug") or "").strip()
+                liquidity_val = _extract_price(
+                    market.get("liquidityNum")
+                    or market.get("liquidity")
+                    or market.get("liquidityClob")
+                )
                 top_rows.append(
                     {
                         "label": self._extract_market_bucket_label(market, bucket_temp),
                         "value": bucket_temp,
                         "temp": bucket_temp,
+                        "direction": row_direction,  # "exact" / "above" / "below"
                         "probability": market_prob,
                         "market_price": yes_midpoint,
                         "yes_buy": yes_buy,
                         "yes_sell": yes_sell,
                         "no_buy": no_buy,
                         "no_sell": no_sell,
+                        "liquidity": liquidity_val,
                         "slug": market_slug or None,
                         "question": market.get("question") or market.get("title"),
                         "is_primary": bool(

@@ -107,6 +107,29 @@ KELLY_MAX_PCT = 10.0          # hard cap: never exceed 10% of bankroll
 _signal_cooldown: dict[str, float] = {}        # legacy channel
 _postpeak_cooldown: dict[str, float] = {}      # @postpeak channel
 
+# ---- HF Elimination Arbitrage ----
+# Dedicated channel for elim-arb signals only (BUY_NO on mathematically
+# eliminated buckets, identified from 5-min weather.gov data before the
+# next hourly METAR confirms). See docs/HF_ELIMINATION_ARBITRAGE.md.
+POSTPEAK_ELIM_CHAT_ID = os.getenv("POSTPEAK_ELIM_CHAT_ID", "").strip()
+ELIM_SIZE_PCT_PER_TRADE = float(os.getenv("ELIM_SIZE_PCT_PER_TRADE", "5.0"))
+ELIM_DAILY_CAP_PCT = float(os.getenv("ELIM_DAILY_CAP_PCT", "15.0"))
+ELIM_MAX_POSITION_USD = float(os.getenv("ELIM_MAX_POSITION_USD", "500"))
+ELIM_LIQUIDITY_BOOK_PCT = float(os.getenv("ELIM_LIQUIDITY_BOOK_PCT", "0.30"))
+ELIM_MIN_EDGE_PCT = float(os.getenv("ELIM_MIN_EDGE_PCT", "1.5"))
+ELIM_HIGH_EDGE_PCT = float(os.getenv("ELIM_HIGH_EDGE_PCT", "8.0"))
+ELIM_MIN_LIQUIDITY_USD = float(os.getenv("ELIM_MIN_LIQUIDITY_USD", "500"))
+ELIM_COOLDOWN_RESET_HOUR_UTC = int(os.getenv("ELIM_COOLDOWN_RESET_HOUR_UTC", "0"))
+
+# Per-bucket cooldown: (city, date, bucket_label) -> timestamp traded
+# Separate from _postpeak_cooldown because one city can fire 5-8 distinct
+# elim trades per day (one per bucket boundary crossed).
+_elim_cooldown: dict[tuple[str, str, str], float] = {}
+# Daily capital deployed per UTC date (for ELIM_DAILY_CAP_PCT enforcement)
+_elim_daily_deployed: dict[str, float] = {}
+# Session trajectory: track bucket crossings per (city, date) for Telegram output
+_elim_session_trajectory: dict[tuple[str, str], list] = {}
+
 # ---------------------------------------------------------------------------
 # Static UTC peak hours per city (typical daily high window in UTC)
 # Used for fast pre-filtering before any API calls.
@@ -219,6 +242,7 @@ def _log_trade_csv(record: dict) -> None:
         "mu", "top1_prob", "top2_prob", "hours_to_peak",
         "market_slug", "market_question", "liquidity", "volume",
         "reasoning", "risk_factors",
+        "side",  # "YES" for BUY_YES trades, "NO" for elim-arb BUY_NO trades
         # filled in later by settlement checker:
         "actual_high", "settlement_bucket", "trade_won", "pnl_usd",
     ]
@@ -1002,6 +1026,309 @@ def _format_telegram_message(decisions: list, bankroll: float) -> str:
 
 
 # ---------------------------------------------------------------------------
+# HF Elimination Arbitrage
+# ---------------------------------------------------------------------------
+
+
+def _send_postpeak_elim_telegram(text: str) -> None:
+    """Send to the dedicated @postpeak_elim channel for elim-arb signals only.
+
+    Falls back to POSTPEAK_CHAT_ID if POSTPEAK_ELIM_CHAT_ID is not set
+    (useful during development; production should use a separate channel).
+    """
+    target = POSTPEAK_ELIM_CHAT_ID or POSTPEAK_CHAT_ID
+    if not (TELEGRAM_BOT_TOKEN and target):
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        httpx.post(
+            url,
+            json={"chat_id": target, "text": text, "parse_mode": "HTML"},
+            timeout=15,
+        )
+    except Exception as e:
+        print(f"  [WARN] @postpeak_elim Telegram send failed: {e}")
+
+
+def _elim_cooldown_key(city: str, date: str, bucket_label: str) -> tuple:
+    return (str(city or "").lower().strip(), str(date or "").strip(), str(bucket_label or "").strip())
+
+
+def _is_elim_on_cooldown(city: str, date: str, bucket_label: str) -> bool:
+    return _elim_cooldown_key(city, date, bucket_label) in _elim_cooldown
+
+
+def _mark_elim_pushed(city: str, date: str, bucket_label: str) -> None:
+    _elim_cooldown[_elim_cooldown_key(city, date, bucket_label)] = time.time()
+
+
+def _today_utc_key() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _elim_daily_deployed_today() -> float:
+    return _elim_daily_deployed.get(_today_utc_key(), 0.0)
+
+
+def _record_elim_deployment(size_usd: float) -> None:
+    key = _today_utc_key()
+    _elim_daily_deployed[key] = _elim_daily_deployed.get(key, 0.0) + float(size_usd)
+
+
+def _reset_elim_cooldown_for_new_day() -> None:
+    """Call when the UTC date rolls over — clears per-bucket cooldown."""
+    _elim_cooldown.clear()
+    # Keep daily deployed for today, clear any prior days
+    today = _today_utc_key()
+    for k in list(_elim_daily_deployed.keys()):
+        if k != today:
+            del _elim_daily_deployed[k]
+
+
+def _session_trajectory_record(city: str, date: str, hf_max: float, hf_max_time: str) -> list:
+    """Append to the session trajectory and return the running list."""
+    key = (str(city or "").lower().strip(), str(date or "").strip())
+    traj = _elim_session_trajectory.get(key) or []
+    # Only keep the observation if max is strictly higher than the last recorded max
+    if not traj or (isinstance(traj[-1], dict) and hf_max > traj[-1].get("temp", -999)):
+        traj.append({"temp": round(float(hf_max), 2), "time": hf_max_time})
+        # Cap to last 20 entries to avoid unbounded growth
+        _elim_session_trajectory[key] = traj[-20:]
+    return _elim_session_trajectory.get(key) or []
+
+
+def _elim_size_usd(
+    *,
+    bankroll: float,
+    no_price: float,
+    liquidity_usd: float | None,
+) -> float:
+    """Compute position size in USD, applying the three caps from §6."""
+    per_trade_cap = bankroll * (ELIM_SIZE_PCT_PER_TRADE / 100.0)
+    daily_remaining = bankroll * (ELIM_DAILY_CAP_PCT / 100.0) - _elim_daily_deployed_today()
+    daily_remaining = max(0.0, daily_remaining)
+    book_cap = float(liquidity_usd or 0.0) * ELIM_LIQUIDITY_BOOK_PCT if liquidity_usd else float("inf")
+    size = min(per_trade_cap, daily_remaining, book_cap, ELIM_MAX_POSITION_USD)
+    return max(0.0, round(size, 2))
+
+
+def evaluate_elimination_trades(
+    *,
+    city: str,
+    display_name: str,
+    elimination: dict,
+    temp_symbol: str,
+    bankroll: float,
+) -> list:
+    """Identify tradable elimination signals for one city.
+
+    Returns a list of elim-trade dicts, each containing everything the
+    Telegram formatter and trading AI need.
+    """
+    if not elimination:
+        return []
+    newly = elimination.get("newly_eliminated_this_tick") or []
+    if not newly:
+        return []
+    date_str = elimination.get("updated_at", "")
+    try:
+        date_str = str(date_str)[:10]
+    except Exception:
+        date_str = ""
+    # Use the UTC date as the cooldown key (matches Polymarket settlement dating)
+    if not date_str:
+        date_str = _today_utc_key()
+
+    eliminated_by_label = {
+        str(b.get("label")): b for b in (elimination.get("eliminated_buckets") or [])
+    }
+
+    hf_max = elimination.get("hf_max")
+    hf_max_time = elimination.get("hf_max_time")
+    hf_source_kind = elimination.get("hf_source_kind")
+    hf_icao = elimination.get("hf_icao")
+
+    trades = []
+    skipped = []
+    for label in newly:
+        bucket = eliminated_by_label.get(label)
+        if not bucket:
+            continue
+        if _is_elim_on_cooldown(city, date_str, label):
+            skipped.append((label, "cooldown"))
+            continue
+        if not bucket.get("tradable"):
+            edge = bucket.get("locked_edge_pct")
+            skipped.append((label, f"not_tradable edge={edge}"))
+            continue
+        no_price = bucket.get("no_price")
+        edge_pct = bucket.get("locked_edge_pct") or 0.0
+        liquidity = bucket.get("liquidity")
+        if edge_pct < ELIM_MIN_EDGE_PCT:
+            skipped.append((label, f"edge={edge_pct}<{ELIM_MIN_EDGE_PCT}"))
+            continue
+        if liquidity is not None and liquidity < ELIM_MIN_LIQUIDITY_USD:
+            skipped.append((label, f"liq={liquidity}<{ELIM_MIN_LIQUIDITY_USD}"))
+            continue
+
+        size_usd = _elim_size_usd(bankroll=bankroll, no_price=no_price, liquidity_usd=liquidity)
+        if size_usd < 10.0:  # floor: below $10 not worth the slippage
+            skipped.append((label, f"size=${size_usd:.0f}<$10 (daily cap reached?)"))
+            continue
+
+        trades.append({
+            "city": city,
+            "display_name": display_name,
+            "bucket_label": label,
+            "slug": bucket.get("slug"),
+            "no_price": no_price,
+            "edge_pct": edge_pct,
+            "liquidity": liquidity,
+            "size_usd": size_usd,
+            "bucket_temp": bucket.get("bucket_temp"),
+            "bucket_upper": bucket.get("bucket_upper"),
+            "hf_max": hf_max,
+            "hf_max_time": hf_max_time,
+            "hf_source_kind": hf_source_kind,
+            "hf_icao": hf_icao,
+            "temp_symbol": temp_symbol,
+            "date": date_str,
+            "high_edge": edge_pct >= ELIM_HIGH_EDGE_PCT,
+        })
+    return trades
+
+
+def _format_elim_telegram_message(
+    trades_by_city: dict,
+    bankroll: float,
+    city_meta: dict,
+) -> str:
+    """Build the verbose ELIM-ARB message per docs/HF_ELIMINATION_ARBITRAGE.md §5.4.
+
+    Args:
+        trades_by_city: {city_key: {"display_name": ..., "trades": [...], "elimination": {...}}}
+        bankroll: total bankroll in USD
+        city_meta: {city_key: {"hf_source": {...}, "elimination": {...}}} passthrough
+    """
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    total_trades = sum(len(entry.get("trades") or []) for entry in trades_by_city.values())
+    lines = [
+        f"[ELIM-ARB] PolyWeather HF Elimination Arbitrage | {now_utc}",
+        f"{total_trades} trade(s) this cycle across {len(trades_by_city)} cit(ies)",
+        "",
+    ]
+    trade_counter = 0
+    total_capital = 0.0
+    total_expected_pnl = 0.0
+    for ckey, entry in trades_by_city.items():
+        disp = entry.get("display_name") or ckey
+        trades = entry.get("trades") or []
+        if not trades:
+            continue
+        elim = entry.get("elimination") or {}
+        hf_max = elim.get("hf_max")
+        hf_max_time = elim.get("hf_max_time")
+        hf_icao = elim.get("hf_icao")
+        hf_src = elim.get("hf_source_kind") or "hf"
+        hf_obs_n = elim.get("hf_observation_count") or 0
+        hf_gap = elim.get("hf_median_gap_min")
+        temp_symbol = trades[0].get("temp_symbol", "°")
+
+        # Session trajectory
+        traj = _elim_session_trajectory.get((ckey, trades[0].get("date", ""))) or []
+        if hf_max is not None and hf_max_time:
+            # Ensure current observation is logged
+            _session_trajectory_record(ckey, trades[0].get("date", ""), hf_max, hf_max_time)
+            traj = _elim_session_trajectory.get((ckey, trades[0].get("date", ""))) or []
+        traj_str = " -> ".join(
+            f"{t.get('temp')}{temp_symbol}@{t.get('time','--:--')}"
+            for t in traj[-6:]
+        )
+
+        already_traded_today = [
+            _bkt for (c, d, _bkt) in _elim_cooldown.keys()
+            if c == ckey and d == trades[0].get("date", "")
+        ]
+
+        lines.append(f"=== {disp.upper()} ===")
+        lines.append(
+            f"  hf_max={hf_max}{temp_symbol} @ {hf_max_time or '--:--'} ({hf_icao or '?'}) "
+            f"| {hf_obs_n} obs @ {hf_gap or '?'}min cadence | source={hf_src}"
+        )
+        if traj_str:
+            lines.append(f"  session trajectory: {traj_str}")
+        if already_traded_today:
+            lines.append(
+                f"  already_traded_today: {sorted(already_traded_today)}"
+            )
+        newly_labels = [t["bucket_label"] for t in trades]
+        lines.append(f"  NEWLY ELIMINATED THIS CYCLE: {newly_labels}")
+
+        live_list = elim.get("live_buckets") or []
+        if live_list:
+            lines.append(f"  live buckets (can still settle YES): {live_list[:8]}")
+        lines.append("")
+
+        for t in trades:
+            trade_counter += 1
+            size = t["size_usd"]
+            total_capital += size
+            expected_pnl = size * (t["edge_pct"] / 100.0)
+            total_expected_pnl += expected_pnl
+            slug = t.get("slug") or ""
+            high_edge_marker = "  *** HIGH EDGE — market likely not yet reacted ***" if t["high_edge"] else ""
+            lines.append(
+                f"  [{trade_counter}] TRADE: BUY_NO {t['bucket_label']} @ "
+                f"{(t['no_price'] or 0)*100:.1f}c  "
+                f"(edge={t['edge_pct']:.2f}%  liq=${(t['liquidity'] or 0):,.0f})"
+            )
+            lines.append(f"      market_slug={slug}")
+            lines.append(
+                f"      target_fill_price<={(t['no_price'] or 0)+0.005:.4f}  "
+                f"min_size_usd=${max(10, size*0.3):.0f}  "
+                f"max_size_usd=${size:.0f}"
+            )
+            lines.append(
+                f"      eliminated_at={hf_max_time or '--:--'}  "
+                f"crossed_by={hf_max}{temp_symbol}  "
+                f"bucket_upper={t.get('bucket_upper')}{temp_symbol}"
+            )
+            lines.append(
+                f"      expected_pnl=${expected_pnl:.2f}  time_to_metar_confirm=~{_minutes_to_next_metar()}min"
+            )
+            lines.append(
+                f"      rationale: HF {hf_max}{temp_symbol} > {t.get('bucket_upper')}{temp_symbol} "
+                f"(bucket upper bound); daily max cannot retreat into {t['bucket_label']} bucket"
+            )
+            if slug:
+                lines.append(f"      url=https://polymarket.com/market/{slug}")
+            if high_edge_marker:
+                lines.append(high_edge_marker)
+            lines.append("")
+
+    lines.append("=== SUMMARY ===")
+    lines.append(
+        f"  total_capital=${total_capital:,.0f}  expected_pnl=${total_expected_pnl:.2f}  "
+        f"bankroll=${bankroll:,.0f}  daily_deployed=${_elim_daily_deployed_today():,.0f}/"
+        f"${bankroll * ELIM_DAILY_CAP_PCT/100:,.0f}"
+    )
+    lines.append(
+        f"  all trades fire in parallel; no inter-dependency. "
+        f"Each is a BUY_NO on a bucket physically impossible for the daily max to settle at."
+    )
+    return "\n".join(lines)
+
+
+def _minutes_to_next_metar() -> int:
+    """METARs typically drop at :50 each hour. Return minutes to the next drop."""
+    now = datetime.now(timezone.utc)
+    m = now.minute
+    if m < 50:
+        return 50 - m
+    return 110 - m  # next hour's :50
+
+
+# ---------------------------------------------------------------------------
 # Main scan
 # ---------------------------------------------------------------------------
 
@@ -1072,6 +1399,34 @@ def scan(*, dry_run: bool = False, bankroll: float = DEFAULT_BANKROLL, wave: str
         fetch_ms = (time.time() - t0) * 1000
         print(f"  Fetched {len(city_data)}/{len(timing_eligible)} cities in {fetch_ms:.0f}ms "
               f"({PARALLEL_WORKERS} workers)\n")
+
+    # Phase 2.5: extra fetch for US HF-eligible cities for ELIM-ARB pass
+    # (elim fires independently of peak timing — it works whenever HF shows
+    # the max has crossed a bucket boundary, which can happen any time after
+    # morning warmup starts).
+    _HF_US_CITIES = {
+        "new york", "los angeles", "san francisco", "aurora", "austin",
+        "houston", "chicago", "dallas", "miami", "atlanta", "seattle",
+        "denver",
+    }
+    city_name_to_display = {c["name"]: c["display_name"] for c in cities}
+    elim_extra_fetch = [
+        n for n in _HF_US_CITIES
+        if n in city_name_to_display and n not in city_data
+    ]
+    if elim_extra_fetch:
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as pool:
+            futures = {pool.submit(_fetch_city_data, name): name for name in elim_extra_fetch}
+            for future in as_completed(futures):
+                name = futures[future]
+                try:
+                    city_data[name] = future.result()
+                except Exception as e:
+                    pass  # silent — these are extras for elim only
+        elim_fetch_ms = (time.time() - t0) * 1000
+        got = sum(1 for n in elim_extra_fetch if n in city_data)
+        print(f"  Elim-arb extra fetch: {got}/{len(elim_extra_fetch)} US HF cities in {elim_fetch_ms:.0f}ms\n")
 
     # Phase 3: apply filters on fetched data (fast, no I/O)
     for name, display, entry_mode, h_to_peak in timing_eligible:
@@ -1227,8 +1582,103 @@ def scan(*, dry_run: bool = False, bankroll: float = DEFAULT_BANKROLL, wave: str
         mp_s = f"{mp:.2f}" if mp is not None else "?"
         h = cand["hours_to_peak"]
         h_s = f"{h:+.1f}h" if h is not None else "?"
-        print(f"  {cand['city']:<13} {cand['entry_mode']:<13} {e_s:>7} {str(cand['top1_val'])+'°':>6} {str(cand['top2_val'])+'°':>6} {cand['sigma']:>5.1f} {cand['metar_trend']:>8} {'$'+str(int(ms.get('liquidity') or 0)):>9} {h_s:>7} {mp_s:>6}")
+        _sigma_val = cand.get("sigma")
+        _sigma_s = f"{_sigma_val:>5.1f}" if isinstance(_sigma_val, (int, float)) else "   ??"
+        _mode_s = str(cand.get("entry_mode") or "none")
+        print(f"  {cand['city']:<13} {_mode_s:<13} {e_s:>7} {str(cand['top1_val'])+'°':>6} {str(cand['top2_val'])+'°':>6} {_sigma_s} {cand['metar_trend']:>8} {'$'+str(int(ms.get('liquidity') or 0)):>9} {h_s:>7} {mp_s:>6}")
     print()
+
+    # ---- HF ELIM-ARB PASS (independent of LLM / timing candidates) ----
+    # Run over all fetched city_data — detect newly-eliminated buckets and
+    # push BUY_NO signals to @postpeak_elim. This pathway is self-contained;
+    # it does not call the LLM.
+    print(f"\n{'-'*70}")
+    print(f"HF Elimination Arbitrage Pass")
+    print(f"{'-'*70}")
+    elim_trades_by_city = {}
+    for name, (d, detail) in city_data.items():
+        # elimination_analysis lives on detail (_build_city_detail_payload)
+        elim = (detail or {}).get("elimination_analysis") or (d or {}).get("elimination_analysis")
+        if not elim:
+            continue
+        temp_symbol = (d or {}).get("temp_symbol") or (detail or {}).get("overview", {}).get("temp_symbol") or "°"
+        display_name = city_name_to_display.get(name, name)
+        elim_trades = evaluate_elimination_trades(
+            city=name,
+            display_name=display_name,
+            elimination=elim,
+            temp_symbol=temp_symbol,
+            bankroll=bankroll,
+        )
+        if elim_trades:
+            elim_trades_by_city[name] = {
+                "display_name": display_name,
+                "elimination": elim,
+                "trades": elim_trades,
+            }
+            print(f"  {display_name:<16} ELIM-ARB  {len(elim_trades)} trade(s):")
+            for t in elim_trades:
+                marker = " *** HIGH EDGE ***" if t["high_edge"] else ""
+                print(
+                    f"    BUY_NO {t['bucket_label']:<16} "
+                    f"@ {(t['no_price'] or 0)*100:.1f}c  "
+                    f"edge={t['edge_pct']:.2f}%  size=${t['size_usd']:.0f}{marker}"
+                )
+        else:
+            newly = elim.get("newly_eliminated_this_tick") or []
+            if newly:
+                # Some newly-eliminated but none tradable (below edge floor / cooldown / liquidity)
+                # Don't print unless verbose
+                pass
+    if not elim_trades_by_city:
+        print("  No elim-arb trades this cycle.")
+    print()
+
+    # Push elim-arb trades to @postpeak_elim
+    if elim_trades_by_city:
+        elim_msg = _format_elim_telegram_message(
+            elim_trades_by_city, bankroll, city_data
+        )
+        print(f"--- @postpeak_elim message ---\n{elim_msg}\n--- end ---\n")
+        if not dry_run:
+            print("Sending to @postpeak_elim ...")
+            _send_postpeak_elim_telegram(elim_msg)
+            # Mark cooldowns and deployed capital
+            for entry in elim_trades_by_city.values():
+                for t in entry.get("trades", []):
+                    _mark_elim_pushed(t["city"], t["date"], t["bucket_label"])
+                    _record_elim_deployment(t["size_usd"])
+                    # Log to trades CSV for P&L tracking
+                    _log_trade_csv({
+                        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                        "city": t["city"],
+                        "date": t["date"],
+                        "entry_mode": "elim_arb",
+                        "bucket": t["bucket_label"],
+                        "adjacent_bucket": None,
+                        "model_probability": 0.995,  # near-certain
+                        "market_price": t["no_price"],
+                        "edge_pct": t["edge_pct"],
+                        "confidence": "high",
+                        "size_pct": (t["size_usd"] / bankroll) * 100.0 if bankroll else 0,
+                        "size_usd": t["size_usd"],
+                        "bankroll": bankroll,
+                        "sigma": None,
+                        "metar_rising": None,
+                        "max_so_far": t["hf_max"],
+                        "deb_prediction": None,
+                        "mu": None,
+                        "top1_prob": None,
+                        "top2_prob": None,
+                        "hours_to_peak": None,
+                        "market_slug": t.get("slug"),
+                        "side": "NO",  # elim arb is always BUY_NO
+                    })
+            print(f"Sent elim-arb. Cooldowns set for {sum(len(e['trades']) for e in elim_trades_by_city.values())} buckets.")
+        else:
+            print("[DRY RUN] Would send elim-arb signals to @postpeak_elim.")
+
+    # ---- END ELIM-ARB PASS ----
 
     # Split: top N go to LLM, rest just printed
     llm_candidates = candidates[:LLM_TOP_N]
@@ -1239,14 +1689,16 @@ def scan(*, dry_run: bool = False, bankroll: float = DEFAULT_BANKROLL, wave: str
 
     if not candidates:
         print("No candidates found. Markets may be closed or no edge detected.")
-        msg = (
-            f"PolyWeather Alpha Scanner | {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n\n"
-            f"No actionable trades found.\n"
-            f"Scanned {len(cities)} cities, 0 candidates.\n"
-            f"Skipped: {json.dumps(dict(list(skipped_reasons.items())[:10]), indent=2)}"
-        )
-        if not dry_run:
-            _send_telegram(msg)
+        # Don't send the generic "no trades" message if we already sent elim-arb
+        if not elim_trades_by_city:
+            msg = (
+                f"PolyWeather Alpha Scanner | {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n\n"
+                f"No actionable trades found.\n"
+                f"Scanned {len(cities)} cities, 0 candidates.\n"
+                f"Skipped: {json.dumps(dict(list(skipped_reasons.items())[:10]), indent=2)}"
+            )
+            if not dry_run:
+                _send_telegram(msg)
         return
 
     # 4. LLM evaluation (top N only, skip obvious non-alpha)

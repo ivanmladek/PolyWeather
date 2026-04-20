@@ -2958,8 +2958,65 @@ def _build_city_market_scan_payload(
         market_scan["anchor_high"] = anchor_temp
         market_scan["anchor_settlement"] = anchor_settlement
         market_scan["open_meteo_settlement"] = anchor_settlement
+
+    # === HF elimination arbitrage analysis ===
+    # Detect which market buckets are mathematically eliminated (daily-max
+    # temperature can't retreat to them) based on HF (5-min weather.gov or
+    # 1-min ASOS) data. See docs/HF_ELIMINATION_ARBITRAGE.md.
+    elimination_analysis = None
+    try:
+        from src.analysis.elimination_arbitrage import (
+            analyze_elimination,
+            append_elimination_log,
+        )
+        hf_source_meta = data.get("hf_source") or {}
+        hf_override = data.get("hf_max_override") or {}
+        all_buckets = (
+            (market_scan or {}).get("all_buckets")
+            if isinstance(market_scan, dict)
+            else None
+        ) or []
+        _use_f = str(data.get("temp_symbol") or "").strip().lower().startswith("°f") or "f" in str(data.get("temp_symbol") or "").lower()
+        hf_max_val = None
+        # Prefer the HF max in the city's display unit (most market buckets
+        # carry temps in the same unit already)
+        if _use_f:
+            hf_max_val = hf_source_meta.get("max_temp")
+        else:
+            hf_max_val = hf_source_meta.get("max_temp")
+        if hf_max_val is None and hf_override:
+            hf_max_val = hf_override.get("hf_max")
+        city_key = str(data.get("name") or "").strip().lower()
+        target_d = selected_date or data.get("local_date") or ""
+        if hf_max_val is not None and all_buckets and city_key and target_d:
+            elimination_analysis = analyze_elimination(
+                city=city_key,
+                target_date=str(target_d),
+                hf_max=float(hf_max_val),
+                hf_max_time=hf_source_meta.get("max_temp_time"),
+                hf_source_kind=hf_source_meta.get("source_kind") or hf_source_meta.get("kind"),
+                hf_icao=hf_source_meta.get("icao"),
+                hf_observation_count=int(hf_source_meta.get("observation_count") or 0),
+                hf_median_gap_min=hf_source_meta.get("median_gap_minutes"),
+                all_buckets=all_buckets,
+                use_fahrenheit=bool(_use_f),
+            )
+            if elimination_analysis:
+                try:
+                    append_elimination_log(
+                        city=city_key,
+                        target_date=str(target_d),
+                        analysis=elimination_analysis,
+                    )
+                except Exception:
+                    pass
+    except Exception as exc:
+        from loguru import logger
+        logger.debug(f"elimination_analysis failed: {exc}")
+
     return {
         "market_scan": market_scan,
+        "elimination_analysis": elimination_analysis,
         "selected_date": selected_date or data.get("local_date"),
         "fetched_at": data.get("updated_at"),
     }
@@ -3061,6 +3118,9 @@ def _build_city_detail_payload(
         "hf_peak_detection": data.get("hf_peak_detection"),
         "hf_alpha": data.get("hf_alpha"),
         "hf_source": data.get("hf_source"),
+        "hf_max_override": data.get("hf_max_override"),
+        # HF elimination arbitrage analysis (computed alongside market_scan)
+        "elimination_analysis": market_payload.get("elimination_analysis"),
         "errors": {},
     }
 

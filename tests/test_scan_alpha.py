@@ -571,3 +571,280 @@ class TestVerboseTelegramMessage:
         # The asterisk-wrapped BUCKET CROSSED line is the key trading trigger
         assert "*** BUCKET CROSSED" in msg
         assert "HF-TRIGGERED ALERT" in msg
+
+
+# ===================================================================
+# HF Elimination Arbitrage — evaluate_elimination_trades + formatter
+# ===================================================================
+
+class TestElimArbEvaluation:
+    """evaluate_elimination_trades — core elim-arb signal filter."""
+
+    def setup_method(self):
+        """Clear elim cooldowns between tests."""
+        scan_alpha._elim_cooldown.clear()
+        scan_alpha._elim_daily_deployed.clear()
+        scan_alpha._elim_session_trajectory.clear()
+
+    def _sf_elim_analysis(self, *, include_64_65=False):
+        """Live-example elimination_analysis like SF Apr 19."""
+        buckets = []
+        if include_64_65:
+            buckets.append({
+                "label": "64-65°F",
+                "slug": "..-64-65f",
+                "bucket_temp": 64.0,
+                "bucket_upper": 65.499,
+                "direction": "exact",
+                "no_price": 0.999,
+                "locked_edge_pct": 0.1,
+                "liquidity": 4837,
+                "tradable": False,  # edge 0.1% below the 1.5% floor
+                "eliminated_at_utc": "2026-04-19T20:45:00Z",
+                "eliminated_by_temp": 68.0,
+            })
+        buckets.append({
+            "label": "66-67°F",
+            "slug": "highest-temperature-in-san-francisco-on-april-19-2026-66-67f",
+            "bucket_temp": 66.0,
+            "bucket_upper": 67.499,
+            "direction": "exact",
+            "no_price": 0.95,
+            "locked_edge_pct": 5.0,
+            "liquidity": 3680,
+            "tradable": True,
+            "eliminated_at_utc": "2026-04-19T21:05:00Z",
+            "eliminated_by_temp": 68.0,
+        })
+        newly = [b["label"] for b in buckets]
+        return {
+            "hf_max": 68.0,
+            "hf_max_time": "12:05",
+            "hf_source_kind": "wgov_5min",
+            "hf_icao": "KSFO",
+            "hf_observation_count": 226,
+            "hf_median_gap_min": 5.0,
+            "eliminated_buckets": buckets,
+            "live_buckets": ["68-69°F", "70F+"],
+            "newly_eliminated_this_tick": newly,
+            "updated_at": "2026-04-19T21:05:00Z",
+        }
+
+    def test_single_tradable_signal(self):
+        elim = self._sf_elim_analysis()
+        trades = scan_alpha.evaluate_elimination_trades(
+            city="san francisco",
+            display_name="San Francisco",
+            elimination=elim,
+            temp_symbol="°F",
+            bankroll=1000.0,
+        )
+        assert len(trades) == 1
+        t = trades[0]
+        assert t["bucket_label"] == "66-67°F"
+        assert t["no_price"] == 0.95
+        assert t["edge_pct"] == 5.0
+        assert t["size_usd"] > 0
+
+    def test_below_edge_floor_skipped(self):
+        """64-65F at 99.9c has 0.1% edge — below 1.5% floor."""
+        elim = self._sf_elim_analysis(include_64_65=True)
+        trades = scan_alpha.evaluate_elimination_trades(
+            city="san francisco",
+            display_name="San Francisco",
+            elimination=elim,
+            temp_symbol="°F",
+            bankroll=1000.0,
+        )
+        labels = [t["bucket_label"] for t in trades]
+        assert "64-65°F" not in labels
+        assert "66-67°F" in labels
+
+    def test_per_bucket_cooldown(self):
+        elim = self._sf_elim_analysis()
+        # First call — trade fires
+        trades1 = scan_alpha.evaluate_elimination_trades(
+            city="san francisco",
+            display_name="San Francisco",
+            elimination=elim,
+            temp_symbol="°F",
+            bankroll=1000.0,
+        )
+        assert len(trades1) == 1
+        # Mark as pushed — simulating Telegram send
+        t = trades1[0]
+        scan_alpha._mark_elim_pushed(t["city"], t["date"], t["bucket_label"])
+        # Second call — cooldown active, no trade
+        trades2 = scan_alpha.evaluate_elimination_trades(
+            city="san francisco",
+            display_name="San Francisco",
+            elimination=elim,
+            temp_symbol="°F",
+            bankroll=1000.0,
+        )
+        assert trades2 == []
+
+    def test_liquidity_floor(self):
+        elim = self._sf_elim_analysis()
+        # Lower liquidity below ELIM_MIN_LIQUIDITY_USD (default $500)
+        elim["eliminated_buckets"][0]["liquidity"] = 100
+        trades = scan_alpha.evaluate_elimination_trades(
+            city="san francisco",
+            display_name="San Francisco",
+            elimination=elim,
+            temp_symbol="°F",
+            bankroll=1000.0,
+        )
+        assert trades == []
+
+    def test_daily_cap_enforcement(self):
+        """Once daily cap is hit, further trades should be sized to 0 and skipped."""
+        elim = self._sf_elim_analysis()
+        # Simulate already-deployed near the daily cap
+        scan_alpha._record_elim_deployment(
+            1000.0 * (scan_alpha.ELIM_DAILY_CAP_PCT / 100.0) - 5  # leave $5 remaining
+        )
+        trades = scan_alpha.evaluate_elimination_trades(
+            city="san francisco",
+            display_name="San Francisco",
+            elimination=elim,
+            temp_symbol="°F",
+            bankroll=1000.0,
+        )
+        # $5 remaining < $10 floor → skipped
+        assert trades == []
+
+    def test_high_edge_marker(self):
+        """An elim trade with edge >= 8% gets marked high_edge=True."""
+        elim = self._sf_elim_analysis()
+        # Override to a high-edge case
+        elim["eliminated_buckets"][0]["no_price"] = 0.89
+        elim["eliminated_buckets"][0]["locked_edge_pct"] = 11.0
+        trades = scan_alpha.evaluate_elimination_trades(
+            city="san francisco",
+            display_name="San Francisco",
+            elimination=elim,
+            temp_symbol="°F",
+            bankroll=1000.0,
+        )
+        assert len(trades) == 1
+        assert trades[0]["high_edge"] is True
+
+
+class TestElimSizeCaps:
+    """_elim_size_usd — three-cap sizing logic."""
+
+    def setup_method(self):
+        scan_alpha._elim_daily_deployed.clear()
+
+    def test_per_trade_cap(self):
+        # bankroll=$1000, per-trade-cap = 5% = $50
+        size = scan_alpha._elim_size_usd(
+            bankroll=1000.0, no_price=0.95, liquidity_usd=100000
+        )
+        assert size == 50.0
+
+    def test_book_depth_cap(self):
+        # bankroll=$1000 (per-trade $50), liquidity=$100 → 30% = $30
+        size = scan_alpha._elim_size_usd(
+            bankroll=1000.0, no_price=0.95, liquidity_usd=100
+        )
+        assert size == 30.0
+
+    def test_daily_cap(self):
+        # bankroll=$1000, daily-cap = 15% = $150
+        # Deploy $145 already; only $5 remaining, floored by other caps
+        scan_alpha._record_elim_deployment(145.0)
+        size = scan_alpha._elim_size_usd(
+            bankroll=1000.0, no_price=0.95, liquidity_usd=100000
+        )
+        assert size == 5.0
+
+
+class TestElimTelegramMessage:
+    """_format_elim_telegram_message — verbose output for trading AIs."""
+
+    def setup_method(self):
+        scan_alpha._elim_cooldown.clear()
+        scan_alpha._elim_daily_deployed.clear()
+        scan_alpha._elim_session_trajectory.clear()
+
+    def _build_trades_by_city(self):
+        elim_sf = {
+            "hf_max": 68.0,
+            "hf_max_time": "12:05",
+            "hf_source_kind": "wgov_5min",
+            "hf_icao": "KSFO",
+            "hf_observation_count": 226,
+            "hf_median_gap_min": 5.0,
+            "eliminated_buckets": [],
+            "live_buckets": ["68-69°F", "70F+"],
+            "newly_eliminated_this_tick": ["66-67°F"],
+        }
+        trades = [{
+            "city": "san francisco",
+            "display_name": "San Francisco",
+            "bucket_label": "66-67°F",
+            "slug": "highest-temperature-in-san-francisco-on-april-19-2026-66-67f",
+            "no_price": 0.95,
+            "edge_pct": 5.0,
+            "liquidity": 3680,
+            "size_usd": 50.0,
+            "bucket_temp": 66.0,
+            "bucket_upper": 67.499,
+            "hf_max": 68.0,
+            "hf_max_time": "12:05",
+            "hf_source_kind": "wgov_5min",
+            "hf_icao": "KSFO",
+            "temp_symbol": "°F",
+            "date": "2026-04-19",
+            "high_edge": False,
+        }]
+        return {
+            "san francisco": {
+                "display_name": "San Francisco",
+                "elimination": elim_sf,
+                "trades": trades,
+            }
+        }, {"san francisco": ({}, {})}
+
+    def test_message_contains_core_sections(self):
+        trades_by_city, city_data = self._build_trades_by_city()
+        msg = scan_alpha._format_elim_telegram_message(
+            trades_by_city, bankroll=1000.0, city_meta=city_data
+        )
+        assert "[ELIM-ARB]" in msg
+        assert "SAN FRANCISCO" in msg
+        assert "KSFO" in msg
+        assert "BUY_NO" in msg
+        assert "66-67°F" in msg
+        assert "edge=5.00%" in msg or "edge=5.0" in msg
+        assert "market_slug=" in msg
+        assert "target_fill_price" in msg
+        assert "rationale:" in msg
+        assert "=== SUMMARY ===" in msg
+
+    def test_message_contains_action_url(self):
+        trades_by_city, city_data = self._build_trades_by_city()
+        msg = scan_alpha._format_elim_telegram_message(
+            trades_by_city, bankroll=1000.0, city_meta=city_data
+        )
+        assert "polymarket.com/market/" in msg
+
+    def test_message_flags_high_edge(self):
+        trades_by_city, city_data = self._build_trades_by_city()
+        trades_by_city["san francisco"]["trades"][0]["high_edge"] = True
+        trades_by_city["san francisco"]["trades"][0]["no_price"] = 0.89
+        trades_by_city["san francisco"]["trades"][0]["edge_pct"] = 11.0
+        msg = scan_alpha._format_elim_telegram_message(
+            trades_by_city, bankroll=1000.0, city_meta=city_data
+        )
+        assert "*** HIGH EDGE" in msg
+
+    def test_message_shows_newly_eliminated_list(self):
+        trades_by_city, city_data = self._build_trades_by_city()
+        msg = scan_alpha._format_elim_telegram_message(
+            trades_by_city, bankroll=1000.0, city_meta=city_data
+        )
+        assert "NEWLY ELIMINATED THIS CYCLE" in msg
+        assert "66-67°F" in msg
