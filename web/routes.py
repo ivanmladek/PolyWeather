@@ -1531,3 +1531,83 @@ async def hf_temperature_eligible_cities(request: Request):
         "precision": "0.1°F",
     }
 
+
+# ---------------------------------------------------------------------------
+# Lightweight elimination-arb scan endpoint (fast, no full analysis)
+# ---------------------------------------------------------------------------
+
+@router.get("/api/city/{name}/elim-scan")
+async def city_elim_scan(request: Request, name: str):
+    """Fast endpoint for elimination arbitrage scanning.
+
+    Fetches ONLY: fresh HF data + market bucket ladder + elimination analysis.
+    Skips the full analysis pipeline (DEB, trend, probability, etc.) for speed.
+    Target latency: <3s per city.
+    """
+    from web.core import _weather, _market_layer
+    from src.analysis.elimination_arbitrage import analyze_elimination, append_elimination_log
+    from src.analysis.settlement_rounding import apply_city_settlement
+
+    city = _normalize_city_or_404(name)
+    city_meta = CITY_REGISTRY.get(city, {})
+    use_fahrenheit = bool(city_meta.get("use_fahrenheit") or city_meta.get("f", False))
+    utc_offset = int(city_meta.get("tz_offset") or city_meta.get("tz", 0))
+    icao = city_meta.get("icao")
+    temp_symbol = "°F" if use_fahrenheit else "°C"
+
+    # 1. Fresh HF data (60s cache, very fast)
+    hf_data = None
+    if icao:
+        hf_data = _weather.fetch_hf_intraday(
+            city, icao=icao, use_fahrenheit=use_fahrenheit, utc_offset=utc_offset
+        )
+
+    hf_max = hf_data.get("max_temp") if hf_data else None
+    hf_max_time = hf_data.get("max_temp_time") if hf_data else None
+
+    # 2. Market bucket ladder (180s cache)
+    from datetime import datetime, timezone, timedelta
+    now_utc = datetime.now(timezone.utc)
+    local_now = now_utc + timedelta(seconds=utc_offset)
+    local_date = local_now.strftime("%Y-%m-%d")
+
+    market_scan = _market_layer.build_market_scan(
+        city=city, target_date=local_date,
+    )
+    all_buckets = (market_scan or {}).get("all_buckets") or []
+
+    # 3. Elimination analysis
+    elimination = None
+    if hf_max is not None and all_buckets:
+        elimination = analyze_elimination(
+            city=city,
+            target_date=local_date,
+            hf_max=float(hf_max),
+            hf_max_time=hf_max_time,
+            hf_source_kind=(hf_data or {}).get("source_kind"),
+            hf_icao=icao,
+            hf_observation_count=int((hf_data or {}).get("observation_count") or 0),
+            hf_median_gap_min=(hf_data or {}).get("median_gap_minutes"),
+            all_buckets=all_buckets,
+            use_fahrenheit=use_fahrenheit,
+        )
+        if elimination:
+            try:
+                append_elimination_log(city=city, target_date=local_date, analysis=elimination)
+            except Exception:
+                pass
+
+    return {
+        "city": city,
+        "icao": icao,
+        "temp_symbol": temp_symbol,
+        "local_date": local_date,
+        "hf_max": hf_max,
+        "hf_max_time": hf_max_time,
+        "hf_observation_count": (hf_data or {}).get("observation_count"),
+        "hf_median_gap_min": (hf_data or {}).get("median_gap_minutes"),
+        "hf_source_kind": (hf_data or {}).get("source_kind"),
+        "bucket_count": len(all_buckets),
+        "elimination_analysis": elimination,
+    }
+

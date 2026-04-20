@@ -1377,9 +1377,10 @@ def scan(*, dry_run: bool = False, bankroll: float = DEFAULT_BANKROLL, wave: str
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     def _fetch_city_data(name: str) -> tuple[dict, dict]:
-        """Fetch city + detail endpoints with force_refresh for fresh HF data."""
-        d = _api_get(f"/api/city/{name}?force_refresh=true")
-        detail = _api_get(f"/api/city/{name}/detail?force_refresh=true")
+        """Fetch city + detail endpoints. Uses cached data (fast) — the HF
+        source updates its own cache every 60s independently."""
+        d = _api_get(f"/api/city/{name}")
+        detail = _api_get(f"/api/city/{name}/detail")
         return d, detail
 
     PARALLEL_WORKERS = 10
@@ -1601,15 +1602,36 @@ def scan(*, dry_run: bool = False, bankroll: float = DEFAULT_BANKROLL, wave: str
     print(f"\n{'-'*70}")
     print(f"HF Elimination Arbitrage Pass")
     print(f"{'-'*70}")
+    # Fast parallel elim-scan: use the lightweight /elim-scan endpoint
+    # instead of the full panel/detail (which takes 10-30s per city).
+    _ALL_ELIM_CITIES = list(set(
+        list(_HF_US_CITIES) + [name for name, _, _, _ in timing_eligible]
+    ))
+    elim_scan_data: dict[str, dict] = {}
+    if _ALL_ELIM_CITIES:
+        t0 = time.time()
+        def _fetch_elim_scan(name: str) -> dict:
+            return _api_get(f"/api/city/{name}/elim-scan")
+        with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as pool:
+            futures = {pool.submit(_fetch_elim_scan, n): n for n in _ALL_ELIM_CITIES if n in city_name_to_display}
+            for future in as_completed(futures):
+                n = futures[future]
+                try:
+                    elim_scan_data[n] = future.result()
+                except Exception:
+                    pass
+        elim_ms = (time.time() - t0) * 1000
+        print(f"  Elim-scan: {len(elim_scan_data)}/{len(_ALL_ELIM_CITIES)} cities in {elim_ms:.0f}ms")
+
     elim_trades_by_city = {}
-    for name, (d, detail) in city_data.items():
-        elim = (detail or {}).get("elimination_analysis") or (d or {}).get("elimination_analysis")
+    for name, edata in elim_scan_data.items():
+        elim = edata.get("elimination_analysis")
         if not elim:
             continue
         # Scanner-side diff: treat ALL eliminated+tradable buckets not yet in
         # _elim_cooldown as "newly eliminated" regardless of the backend's flag.
         all_elim_buckets = elim.get("eliminated_buckets") or []
-        date_key = elim.get("updated_at", "")[:10] or _today_utc_key()
+        date_key = edata.get("local_date") or _today_utc_key()
         scanner_newly = []
         for b in all_elim_buckets:
             lbl = str(b.get("label") or "")
@@ -1620,7 +1642,7 @@ def scan(*, dry_run: bool = False, bankroll: float = DEFAULT_BANKROLL, wave: str
         # Override backend's newly_eliminated_this_tick with scanner's own diff
         elim["newly_eliminated_this_tick"] = scanner_newly
 
-        temp_symbol = (d or {}).get("temp_symbol") or (detail or {}).get("overview", {}).get("temp_symbol") or "°"
+        temp_symbol = edata.get("temp_symbol") or "°"
         display_name = city_name_to_display.get(name, name)
         elim_trades = evaluate_elimination_trades(
             city=name,
