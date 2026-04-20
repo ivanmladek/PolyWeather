@@ -118,7 +118,7 @@ ELIM_MAX_POSITION_USD = float(os.getenv("ELIM_MAX_POSITION_USD", "500"))
 ELIM_LIQUIDITY_BOOK_PCT = float(os.getenv("ELIM_LIQUIDITY_BOOK_PCT", "0.30"))
 ELIM_MIN_EDGE_PCT = float(os.getenv("ELIM_MIN_EDGE_PCT", "1.5"))
 ELIM_HIGH_EDGE_PCT = float(os.getenv("ELIM_HIGH_EDGE_PCT", "8.0"))
-ELIM_MIN_LIQUIDITY_USD = float(os.getenv("ELIM_MIN_LIQUIDITY_USD", "500"))
+ELIM_MIN_LIQUIDITY_USD = float(os.getenv("ELIM_MIN_LIQUIDITY_USD", "100"))
 ELIM_COOLDOWN_RESET_HOUR_UTC = int(os.getenv("ELIM_COOLDOWN_RESET_HOUR_UTC", "0"))
 
 # Per-bucket cooldown: (city, date, bucket_label) -> timestamp traded

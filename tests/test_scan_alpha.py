@@ -686,8 +686,8 @@ class TestElimArbEvaluation:
 
     def test_liquidity_floor(self):
         elim = self._sf_elim_analysis()
-        # Lower liquidity below ELIM_MIN_LIQUIDITY_USD (default $500)
-        elim["eliminated_buckets"][0]["liquidity"] = 100
+        # Lower liquidity below ELIM_MIN_LIQUIDITY_USD (default $100)
+        elim["eliminated_buckets"][0]["liquidity"] = 50
         trades = scan_alpha.evaluate_elimination_trades(
             city="san francisco",
             display_name="San Francisco",

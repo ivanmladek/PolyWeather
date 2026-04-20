@@ -49,7 +49,8 @@ MIN_EDGE_FRACTION = float(os.getenv("ELIM_MIN_EDGE_FRACTION", "0.015"))  # 1.5%
 MAX_NO_PRICE = float(os.getenv("ELIM_MAX_NO_PRICE", "0.98"))
 
 # Minimum NO-side liquidity to avoid walking the book on a thin market.
-MIN_NO_LIQUIDITY_USD = float(os.getenv("ELIM_MIN_NO_LIQUIDITY_USD", "500"))
+# Weather markets often have $200-500 per bucket; keep this low to catch trades.
+MIN_NO_LIQUIDITY_USD = float(os.getenv("ELIM_MIN_NO_LIQUIDITY_USD", "100"))
 
 # Minimum number of HF observations required before we trust the HF max.
 # One outlier reading shouldn't trigger a trade.
