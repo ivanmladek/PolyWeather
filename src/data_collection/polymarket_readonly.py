@@ -1029,6 +1029,21 @@ class PolymarketReadOnlyLayer:
         match = re.search(r"(-?\d+(?:\.\d+)?)\s*°?\s*c\b", text, re.IGNORECASE)
         if match:
             return _safe_float(match.group(1))
+        # Match "... 65°F ..." / "... 65F ..." / "... 65 F ..." in question/title
+        # Use the question text ONLY (not slug) to avoid slug-separator false matches.
+        question_text = " ".join(
+            str(part or "")
+            for part in (market.get("question"), market.get("title"))
+        ).strip()
+        if question_text:
+            match_f = re.search(r"(?<!\w)(-?\d+(?:\.\d+)?)\s*°?\s*f\b", question_text, re.IGNORECASE)
+            if match_f:
+                return _safe_float(match_f.group(1))
+        # Fallback: extract from slug (e.g. "...-74-75f" → extract first number)
+        slug = str(market.get("slug") or "")
+        slug_match = re.search(r"-(\d+)(?:-\d+)?f(?:or|$|-)", slug, re.IGNORECASE)
+        if slug_match:
+            return _safe_float(slug_match.group(1))
         return None
 
     def _build_weather_event_slug(self, city_key: str, target_date: str) -> Optional[str]:
@@ -1098,6 +1113,12 @@ class PolymarketReadOnlyLayer:
         result: List[Dict[str, Any]] = []
 
         direct_tokens = market.get("tokens")
+        # Gamma event endpoint returns tokens as a JSON-encoded string; parse it.
+        if isinstance(direct_tokens, str):
+            try:
+                direct_tokens = json.loads(direct_tokens)
+            except Exception:
+                direct_tokens = None
         if isinstance(direct_tokens, list):
             for token in direct_tokens:
                 token_obj = _to_plain_dict(token)
