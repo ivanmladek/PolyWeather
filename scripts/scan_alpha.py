@@ -1377,9 +1377,9 @@ def scan(*, dry_run: bool = False, bankroll: float = DEFAULT_BANKROLL, wave: str
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     def _fetch_city_data(name: str) -> tuple[dict, dict]:
-        """Fetch city + detail endpoints. Returns (city_data, detail_data)."""
-        d = _api_get(f"/api/city/{name}")
-        detail = _api_get(f"/api/city/{name}/detail")
+        """Fetch city + detail endpoints with force_refresh for fresh HF data."""
+        d = _api_get(f"/api/city/{name}?force_refresh=true")
+        detail = _api_get(f"/api/city/{name}/detail?force_refresh=true")
         return d, detail
 
     PARALLEL_WORKERS = 10
