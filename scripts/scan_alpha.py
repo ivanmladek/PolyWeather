@@ -1592,15 +1592,34 @@ def scan(*, dry_run: bool = False, bankroll: float = DEFAULT_BANKROLL, wave: str
     # Run over all fetched city_data — detect newly-eliminated buckets and
     # push BUY_NO signals to @postpeak_elim. This pathway is self-contained;
     # it does not call the LLM.
+    #
+    # IMPORTANT: the backend's `newly_eliminated_this_tick` is unreliable
+    # because the API caches results and the prior-state diff runs server-side
+    # (a dashboard load can consume the "newly" flag before the scanner sees
+    # it). So we maintain our OWN scanner-side diff: any eliminated+tradable
+    # bucket NOT already in _elim_cooldown is treated as newly-eliminated.
     print(f"\n{'-'*70}")
     print(f"HF Elimination Arbitrage Pass")
     print(f"{'-'*70}")
     elim_trades_by_city = {}
     for name, (d, detail) in city_data.items():
-        # elimination_analysis lives on detail (_build_city_detail_payload)
         elim = (detail or {}).get("elimination_analysis") or (d or {}).get("elimination_analysis")
         if not elim:
             continue
+        # Scanner-side diff: treat ALL eliminated+tradable buckets not yet in
+        # _elim_cooldown as "newly eliminated" regardless of the backend's flag.
+        all_elim_buckets = elim.get("eliminated_buckets") or []
+        date_key = elim.get("updated_at", "")[:10] or _today_utc_key()
+        scanner_newly = []
+        for b in all_elim_buckets:
+            lbl = str(b.get("label") or "")
+            if not lbl:
+                continue
+            if not _is_elim_on_cooldown(name, date_key, lbl):
+                scanner_newly.append(lbl)
+        # Override backend's newly_eliminated_this_tick with scanner's own diff
+        elim["newly_eliminated_this_tick"] = scanner_newly
+
         temp_symbol = (d or {}).get("temp_symbol") or (detail or {}).get("overview", {}).get("temp_symbol") or "°"
         display_name = city_name_to_display.get(name, name)
         elim_trades = evaluate_elimination_trades(
