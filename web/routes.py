@@ -1542,11 +1542,10 @@ async def city_elim_scan(request: Request, name: str):
 
     Fetches ONLY: fresh HF data + market bucket ladder + elimination analysis.
     Skips the full analysis pipeline (DEB, trend, probability, etc.) for speed.
-    Target latency: <3s per city.
+    Target latency: <2s per city (uses cached market data, only HF is live).
     """
     from web.core import _weather, _market_layer
     from src.analysis.elimination_arbitrage import analyze_elimination, append_elimination_log
-    from src.analysis.settlement_rounding import apply_city_settlement
 
     city = _normalize_city_or_404(name)
     city_meta = CITY_REGISTRY.get(city, {})
@@ -1555,7 +1554,7 @@ async def city_elim_scan(request: Request, name: str):
     icao = city_meta.get("icao")
     temp_symbol = "°F" if use_fahrenheit else "°C"
 
-    # 1. Fresh HF data (60s cache, very fast)
+    # 1. Fresh HF data (30s cache — the only live fetch)
     hf_data = None
     if icao:
         hf_data = _weather.fetch_hf_intraday(
@@ -1565,22 +1564,39 @@ async def city_elim_scan(request: Request, name: str):
     hf_max = hf_data.get("max_temp") if hf_data else None
     hf_max_time = hf_data.get("max_temp_time") if hf_data else None
 
-    # 2. Market bucket ladder — temporarily lower cache TTLs for freshest prices
     from datetime import datetime, timezone, timedelta
     now_utc = datetime.now(timezone.utc)
     local_now = now_utc + timedelta(seconds=utc_offset)
     local_date = local_now.strftime("%Y-%m-%d")
 
-    # Temporarily lower price cache to 5s for the elim-scan path
-    original_price_ttl = _market_layer.price_cache_ttl
-    _market_layer.price_cache_ttl = 5
-    try:
-        market_scan = _market_layer.build_market_scan(
-            city=city, target_date=local_date,
-        )
-    finally:
-        _market_layer.price_cache_ttl = original_price_ttl
-    all_buckets = (market_scan or {}).get("all_buckets") or []
+    # 2. Market bucket ladder — use CACHED data only (no live Polymarket fetch).
+    # build_market_scan takes 20-30s per city; for elim-arb we use cached
+    # prices which are accurate enough (looking for 5-20% edges, not 0.1%).
+    all_buckets = []
+
+    def _get_cached_buckets():
+        for kind in ("market", "panel"):
+            try:
+                cached = _CACHE_DB.get_city_cache(kind, city)
+                if not cached:
+                    continue
+                payload = cached.get("payload") or {}
+                ms = payload.get("market_scan") or payload
+                buckets = ms.get("all_buckets") or []
+                if buckets:
+                    return buckets
+            except Exception:
+                continue
+        return []
+
+    all_buckets = await run_in_threadpool(_get_cached_buckets)
+    if not all_buckets:
+        # Cache miss (first call, or cache from before Fahrenheit fix).
+        # Do the slow fetch — it'll be cached for subsequent calls.
+        def _build_fresh():
+            ms = _market_layer.build_market_scan(city=city, target_date=local_date)
+            return (ms or {}).get("all_buckets") or []
+        all_buckets = await run_in_threadpool(_build_fresh)
 
     # 3. Elimination analysis
     elimination = None
