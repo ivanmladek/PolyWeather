@@ -1569,12 +1569,13 @@ async def city_elim_scan(request: Request, name: str):
     local_now = now_utc + timedelta(seconds=utc_offset)
     local_date = local_now.strftime("%Y-%m-%d")
 
-    # 2. Market bucket ladder — use CACHED data only (no live Polymarket fetch).
-    # build_market_scan takes 20-30s per city; for elim-arb we use cached
-    # prices which are accurate enough (looking for 5-20% edges, not 0.1%).
+    # 2. Market bucket ladder — bucket LIST from cache (doesn't change intraday),
+    # but ALWAYS fetch fresh NO prices for buckets below HF max (the tradable
+    # candidates). The price cache TTL is 5s for this path so we get live prices.
     all_buckets = []
 
     def _get_cached_buckets():
+        """Get the bucket list/structure from cache (labels, temps, slugs, tokens)."""
         for kind in ("market", "panel"):
             try:
                 cached = _CACHE_DB.get_city_cache(kind, city)
@@ -1591,12 +1592,111 @@ async def city_elim_scan(request: Request, name: str):
 
     all_buckets = await run_in_threadpool(_get_cached_buckets)
     if not all_buckets:
-        # Cache miss (first call, or cache from before Fahrenheit fix).
-        # Do the slow fetch — it'll be cached for subsequent calls.
+        # Cache miss — do the full scan once (populates cache for future calls)
         def _build_fresh():
             ms = _market_layer.build_market_scan(city=city, target_date=local_date)
             return (ms or {}).get("all_buckets") or []
         all_buckets = await run_in_threadpool(_build_fresh)
+
+    # 2b. Refresh NO prices for buckets potentially eliminated by HF.
+    # Build a slug→market map ONCE, then fetch fresh prices for candidate buckets.
+    if all_buckets and hf_max is not None:
+        def _refresh_prices_for_tradable_buckets():
+            from src.data_collection.polymarket_readonly import _extract_price
+            # Load the event markets once to get token_ids for all buckets
+            event_slug = _market_layer._build_weather_event_slug(city, local_date)
+            event_markets = _market_layer._load_event_markets(event_slug) if event_slug else []
+            market_by_slug = {str(m.get("slug") or ""): m for m in event_markets}
+
+            refreshed = []
+            orig_ttl = _market_layer.price_cache_ttl
+            _market_layer.price_cache_ttl = 3  # fresh-ish prices for elim-arb
+            try:
+                for bucket in all_buckets:
+                    b = dict(bucket)
+                    btemp = b.get("temp")
+                    bdir = b.get("direction") or "exact"
+                    # Refresh only buckets that could be eliminated (temp < hf_max + margin)
+                    needs_fresh = (
+                        bdir == "below"
+                        or (btemp is not None and float(btemp) <= float(hf_max) + 1.5)
+                    )
+                    if not needs_fresh:
+                        refreshed.append(b)
+                        continue
+                    slug = str(b.get("slug") or "")
+                    market_obj = market_by_slug.get(slug)
+                    if not market_obj:
+                        refreshed.append(b)
+                        continue
+                    try:
+                        tokens = _market_layer._extract_market_tokens(market_obj)
+                        yes_tok, no_tok = _market_layer._resolve_yes_no_tokens(tokens)
+
+                        # Fetch fresh CLOB data for NO side
+                        if no_tok and no_tok.get("token_id"):
+                            np_data = _market_layer._get_token_market_data(str(no_tok["token_id"]))
+                            # Try buy, then midpoint, then last_trade_price
+                            fresh_no_buy = (
+                                _extract_price(np_data.get("buy"))
+                                or _extract_price(np_data.get("midpoint"))
+                                or _extract_price(np_data.get("last_trade_price"))
+                                or no_tok.get("implied_probability")
+                            )
+                            if fresh_no_buy is not None:
+                                b["no_buy"] = float(fresh_no_buy)
+                                b["no_sell"] = (
+                                    _extract_price(np_data.get("sell"))
+                                    or b.get("no_sell")
+                                )
+
+                        # If NO still None, try YES side and invert
+                        if b.get("no_buy") is None and yes_tok and yes_tok.get("token_id"):
+                            yp_data = _market_layer._get_token_market_data(str(yes_tok["token_id"]))
+                            fresh_yes_buy = (
+                                _extract_price(yp_data.get("buy"))
+                                or _extract_price(yp_data.get("midpoint"))
+                                or _extract_price(yp_data.get("last_trade_price"))
+                                or yes_tok.get("implied_probability")
+                            )
+                            if fresh_yes_buy is not None:
+                                b["no_buy"] = max(0.0, min(1.0, 1.0 - float(fresh_yes_buy)))
+
+                        # Final fallback: use outcomePrices from the event payload
+                        if b.get("no_buy") is None:
+                            import json as _json
+                            prices_raw = market_obj.get("outcomePrices")
+                            if isinstance(prices_raw, str):
+                                try:
+                                    prices_list = _json.loads(prices_raw)
+                                except Exception:
+                                    prices_list = []
+                            else:
+                                prices_list = prices_raw or []
+                            # outcomePrices is [yes_price, no_price] typically
+                            if len(prices_list) >= 2:
+                                try:
+                                    b["no_buy"] = float(prices_list[1])
+                                except Exception:
+                                    pass
+
+                        # Grab liquidity from the market payload
+                        if b.get("liquidity") is None or b.get("liquidity") == 0:
+                            liq = _extract_price(
+                                market_obj.get("liquidityNum")
+                                or market_obj.get("liquidity")
+                                or market_obj.get("liquidityClob")
+                            )
+                            if liq is not None and liq > 0:
+                                b["liquidity"] = liq
+                    except Exception as exc:
+                        pass
+                    refreshed.append(b)
+            finally:
+                _market_layer.price_cache_ttl = orig_ttl
+            return refreshed
+
+        all_buckets = await run_in_threadpool(_refresh_prices_for_tradable_buckets)
 
     # 3. Elimination analysis
     elimination = None
