@@ -1,0 +1,19 @@
+# Copy to terraform.tfvars and fill in your values
+#
+# Required:
+project_id = "your-gcp-project-id"
+image      = "gcr.io/your-gcp-project-id/hf-elim-pubsub"
+
+# Optional overrides:
+# region         = "us-central1"
+# service_name   = "hf-elim-pubsub"
+# pubsub_topic   = "hf-weather-obs"
+# scheduler_cron = "*/2 * * * *"
+# memory         = "512Mi"
+# cpu            = "1"
+# max_instances  = 3
+# min_instances  = 0
+
+# Secret Manager secret names (must already exist with a version):
+# telegram_bot_token_secret      = "TELEGRAM_BOT_TOKEN"
+# postpeak_elim_chat_id_secret   = "POSTPEAK_ELIM_CHAT_ID"

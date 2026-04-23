@@ -1,0 +1,29 @@
+# Inherit .gitignore rules
+#!include:.gitignore
+
+# Large directories not needed for the HF elim service
+.git
+frontend/
+data/
+artifacts/
+notebooks/
+docs/
+.venv/
+venv/
+.uv-cache/
+.uv-python/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+__pycache__/
+*.log
+*.db
+*.sqlite
+*.pyc
+.env
+.env.*
+node_modules/
+.agent/
+.vscode/
+.github/
+web/static/
