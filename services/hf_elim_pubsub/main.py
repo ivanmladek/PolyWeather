@@ -31,7 +31,7 @@ if _ROOT not in sys.path:
 
 import flask
 import httpx
-from google.cloud import pubsub_v1
+from google.cloud import firestore, pubsub_v1
 from loguru import logger
 
 from src.data_collection.city_registry import CITY_REGISTRY
@@ -62,6 +62,47 @@ US_CITIES = {
 app = flask.Flask(__name__)
 _pub: pubsub_v1.PublisherClient | None = None
 _mkt = PolymarketReadOnlyLayer()
+_fs: firestore.Client | None = None
+
+FIRESTORE_DB = os.getenv("FIRESTORE_DATABASE", "elim-dedup")
+
+
+def _firestore() -> firestore.Client:
+    """Lazy-init Firestore client for alert dedup."""
+    global _fs
+    if _fs is None:
+        _fs = firestore.Client(database=FIRESTORE_DB)
+    return _fs
+
+
+def _dedup_key(city: str, date: str, label: str) -> str:
+    """Deterministic doc ID: one alert per bucket per city per day."""
+    return f"{city}:{date}:{label}"
+
+
+def _already_sent(city: str, date: str, label: str) -> bool:
+    """Check Firestore if we already alerted for this bucket-city-date."""
+    try:
+        doc = _firestore().collection("elim_sent").document(_dedup_key(city, date, label)).get()
+        return doc.exists
+    except Exception as e:
+        logger.warning(f"Firestore read failed (allowing alert): {e}")
+        return False  # fail-open: send alert if dedup is down
+
+
+def _mark_sent(city: str, date: str, label: str, temp: float, edge: float):
+    """Record that we sent an alert for this bucket-city-date."""
+    try:
+        _firestore().collection("elim_sent").document(_dedup_key(city, date, label)).set({
+            "city": city,
+            "date": date,
+            "bucket": label,
+            "temp_f": temp,
+            "edge_pct": edge,
+            "sent_at": firestore.SERVER_TIMESTAMP,
+        })
+    except Exception as e:
+        logger.warning(f"Firestore write failed: {e}")
 
 
 def _publisher() -> pubsub_v1.PublisherClient:
@@ -200,19 +241,29 @@ def process():
             "liquidity": liq,
         })
 
-    if alerts:
-        _send_telegram_alert(city, temp_f, obs, alerts)
+    # --- Dedup: only alert once per bucket-city-date ---
+    new_alerts = [a for a in alerts if not _already_sent(city, today, a["label"])]
+
+    if new_alerts:
+        _send_telegram_alert(city, temp_f, obs, new_alerts)
+        for a in new_alerts:
+            _mark_sent(city, today, a["label"], temp_f, a["edge_pct"])
         logger.info(
-            f"ELIM {city}: {temp_f}°F → {len(alerts)} bucket(s) w/ NO<{MAX_NO_PRICE*100:.0f}c: "
-            + ", ".join(a["label"] for a in alerts)
+            f"ELIM {city}: {temp_f}°F → {len(new_alerts)} NEW alert(s): "
+            + ", ".join(a["label"] for a in new_alerts)
+        )
+    elif alerts:
+        logger.debug(
+            f"ELIM {city}: {temp_f}°F → {len(alerts)} crossing(s) already sent today"
         )
 
     return flask.jsonify({
-        "action": "alert" if alerts else "no_alert",
+        "action": "alert" if new_alerts else ("dedup" if alerts else "no_alert"),
         "city": city,
         "temp_f": temp_f,
         "buckets_checked": len(buckets),
         "crossings": len(alerts),
+        "new_alerts": len(new_alerts),
     }), 200
 
 

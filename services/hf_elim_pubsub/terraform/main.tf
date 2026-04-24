@@ -24,10 +24,23 @@ resource "google_project_service" "apis" {
     "pubsub.googleapis.com",
     "cloudscheduler.googleapis.com",
     "secretmanager.googleapis.com",
+    "firestore.googleapis.com",
   ])
 
   service            = each.value
   disable_on_destroy = false
+}
+
+# ---------------------------------------------------------------------------
+# Firestore — dedup store for alert notifications (one per bucket-city-date)
+# ---------------------------------------------------------------------------
+
+resource "google_firestore_database" "elim_dedup" {
+  name        = "elim-dedup"
+  location_id = var.region
+  type        = "FIRESTORE_NATIVE"
+
+  depends_on = [google_project_service.apis]
 }
 
 # ---------------------------------------------------------------------------
@@ -86,6 +99,10 @@ resource "google_cloud_run_v2_service" "elim" {
         name  = "PUBSUB_TOPIC"
         value = var.pubsub_topic
       }
+      env {
+        name  = "FIRESTORE_DATABASE"
+        value = google_firestore_database.elim_dedup.name
+      }
 
       # Secrets from Secret Manager
       env {
@@ -139,6 +156,13 @@ resource "google_secret_manager_secret_iam_member" "tg_chat" {
   secret_id = var.postpeak_elim_chat_id_secret
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${google_service_account.runtime.email}"
+}
+
+# Grant runtime SA access to Firestore (dedup store)
+resource "google_project_iam_member" "runtime_firestore" {
+  project = var.project_id
+  role    = "roles/datastore.user"
+  member  = "serviceAccount:${google_service_account.runtime.email}"
 }
 
 # Grant runtime SA permission to publish to Pub/Sub
