@@ -21,7 +21,7 @@ import base64
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Project root on sys.path for DRY imports from src/
@@ -200,7 +200,14 @@ def process():
     city = obs["city"]
     temp_f = obs["temp_f"]
     icao = obs["icao"]
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Use the CITY'S LOCAL DATE — not UTC.
+    # Polymarket settles on local calendar date (e.g. "April 25 in Chicago" = CDT).
+    # Without this, observations from 8 PM CDT April 24 (= 01:00 UTC April 25)
+    # would incorrectly match against April 25's market.
+    tz_offset = CITY_REGISTRY.get(city, {}).get("tz_offset", 0)
+    local_now = datetime.now(timezone.utc) + timedelta(seconds=tz_offset)
+    today = local_now.strftime("%Y-%m-%d")
 
     # --- Fetch Polymarket bucket ladder (live prices) ---
     buckets = _get_bucket_ladder(city, today)
