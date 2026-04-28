@@ -123,6 +123,15 @@ resource "google_cloud_run_v2_service" "elim" {
           }
         }
       }
+      env {
+        name = "ANTHROPIC_API_KEY"
+        value_source {
+          secret_key_ref {
+            secret  = var.anthropic_api_key_secret
+            version = "latest"
+          }
+        }
+      }
 
       ports {
         container_port = 8080
@@ -154,6 +163,13 @@ resource "google_secret_manager_secret_iam_member" "tg_token" {
 
 resource "google_secret_manager_secret_iam_member" "tg_chat" {
   secret_id = var.postpeak_elim_chat_id_secret
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.runtime.email}"
+}
+
+# Grant runtime SA access to Anthropic API key secret
+resource "google_secret_manager_secret_iam_member" "anthropic_key" {
+  secret_id = var.anthropic_api_key_secret
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${google_service_account.runtime.email}"
 }

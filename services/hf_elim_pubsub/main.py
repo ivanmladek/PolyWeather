@@ -53,6 +53,12 @@ TG_CHAT = os.getenv("POSTPEAK_ELIM_CHAT_ID", "")
 # NO price threshold: alert when NO price is BELOW this (i.e. there's edge)
 MAX_NO_PRICE = float(os.getenv("ELIM_MAX_NO_PRICE", "0.98"))
 
+# LLM gate — Anthropic (primary) or Groq (fallback)
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+LLM_MODEL_ANTHROPIC = os.getenv("ELIM_LLM_MODEL", "claude-sonnet-4-20250514")
+LLM_MODEL_GROQ = os.getenv("ELIM_LLM_MODEL_GROQ", "llama-3.3-70b-versatile")
+
 # US cities eligible for 5-min weather.gov HF feed
 US_CITIES = {
     k: v for k, v in CITY_REGISTRY.items()
@@ -294,14 +300,45 @@ def process():
     # --- Dedup: only alert once per bucket-city-date ---
     new_alerts = [a for a in alerts if not _already_sent(city, today, a["label"])]
 
-    if new_alerts:
-        _send_telegram_alert(city, temp_f, obs, new_alerts, window)
+    # --- LLM gate: ask Claude/Groq for YES/NO on each new alert ---
+    approved = []
+    for a in new_alerts:
+        prompt = _build_llm_context(city, today, temp_f, obs, a, window, buckets)
+        llm = _call_llm_gate(prompt)
+
+        if llm is None:
+            # No LLM key or call failed — auto-approve (fail-open)
+            a["llm_action"] = "AUTO_APPROVED"
+            a["llm_reasoning"] = "LLM gate unavailable — auto-approved"
+            a["llm_confidence"] = "n/a"
+            approved.append(a)
+        elif str(llm.get("action", "")).upper().startswith("BUY"):
+            a["llm_action"] = llm.get("action", "BUY_NO")
+            a["llm_reasoning"] = llm.get("reasoning", "")
+            a["llm_confidence"] = llm.get("confidence", "?")
+            a["llm_risk_factors"] = llm.get("risk_factors", [])
+            approved.append(a)
+        else:
+            # LLM said SKIP
+            logger.info(
+                f"LLM SKIP {city} {a['label']}: {llm.get('reasoning', '?')}"
+            )
+
+    if approved:
+        _send_telegram_alert(city, temp_f, obs, approved, window)
+        for a in approved:
+            _mark_sent(city, today, a["label"], temp_f, a["edge_pct"])
+        logger.info(
+            f"ELIM {city}: {temp_f}°F → {len(approved)}/{len(new_alerts)} approved by LLM "
+            f"(N={CONFIRM_N} confirmed): "
+            + ", ".join(a["label"] for a in approved)
+        )
+    elif new_alerts:
+        # LLM rejected all — still mark as sent to avoid re-evaluation
         for a in new_alerts:
             _mark_sent(city, today, a["label"], temp_f, a["edge_pct"])
         logger.info(
-            f"ELIM {city}: {temp_f}°F → {len(new_alerts)} NEW alert(s) "
-            f"(N={CONFIRM_N} confirmed): "
-            + ", ".join(a["label"] for a in new_alerts)
+            f"ELIM {city}: {temp_f}°F → {len(new_alerts)} crossing(s) REJECTED by LLM"
         )
     elif alerts:
         logger.debug(
@@ -309,14 +346,176 @@ def process():
         )
 
     return flask.jsonify({
-        "action": "alert" if new_alerts else ("dedup" if alerts else "no_alert"),
+        "action": "alert" if approved else (
+            "llm_skip" if new_alerts else ("dedup" if alerts else "no_alert")),
         "city": city,
         "temp_f": temp_f,
         "window": window,
         "buckets_checked": len(buckets),
         "crossings": len(alerts),
         "new_alerts": len(new_alerts),
+        "llm_approved": len(approved),
     }), 200
+
+
+# ---------------------------------------------------------------------------
+# LLM gate — asks Claude/Groq whether the elimination is trustworthy
+# ---------------------------------------------------------------------------
+
+_ELIM_SYSTEM_PROMPT = """\
+You are an HF temperature elimination arbitrage analyst for Polymarket weather markets.
+
+You receive a CONFIRMED elimination signal: N consecutive high-frequency weather.gov
+readings show a US city's temperature has crossed above a Polymarket bucket's upper
+bound. The daily max CANNOT retreat — this is thermodynamic fact.
+
+Your job: decide if buying NO on this bucket is a good trade RIGHT NOW.
+
+WHAT MAKES A GOOD ELIMINATION TRADE:
+- Temperature is WELL above the bucket upper (not borderline 0.1-0.3°F above)
+- Multiple consecutive readings confirm (not just barely N=2)
+- The NO price has real edge (buying at 85c for guaranteed $1 = 15c profit)
+- Sufficient liquidity to fill without walking the book
+- Settlement rounding won't reverse the elimination (watch C→F conversion artifacts:
+  e.g. 31.0°C = 87.8°F is only 0.3°F above 87.49 upper — METAR might report 87°F)
+
+RED FLAGS — reasons to SKIP:
+- Temperature is within 0.5°F of bucket upper (sensor rounding can flip settlement)
+- The readings are at Celsius whole-number boundaries (e.g. 29.0°C=84.2°F, 31.0°C=87.8°F)
+  because METAR reports Celsius and the C→F conversion creates false precision
+- NO price >= 95c with low liquidity (not worth the execution risk)
+- The observation time suggests prior-day residual heat (late evening local time)
+
+Respond ONLY with valid JSON:
+{
+  "action": "BUY_NO" | "SKIP",
+  "confidence": "high" | "medium" | "low",
+  "reasoning": "<2-3 sentences>",
+  "risk_factors": ["<factor1>", "<factor2>"],
+  "margin_above_upper": "<how far temp is above bucket upper in °F>"
+}
+"""
+
+
+def _build_llm_context(city: str, today: str, temp_f: float, obs: dict,
+                       alert: dict, window: list[float], all_buckets: list) -> str:
+    """Build the user prompt with all relevant context for LLM evaluation."""
+    info = CITY_REGISTRY.get(city, {})
+    name = info.get("name", city)
+    obs_time = (obs.get("time") or "?")[:19]
+    upper = alert["bucket_upper"]
+    margin = round(temp_f - upper, 2)
+
+    # Nearby bucket context
+    bucket_context = []
+    for b in all_buckets:
+        bt = b.get("temp") or b.get("value")
+        no = b.get("no_buy")
+        if bt is not None:
+            no_str = f"NO={float(no)*100:.1f}c" if no is not None else "NO=n/a"
+            bucket_context.append(
+                f"  {b.get('label','?'):<10} {b.get('direction','exact'):<6} {no_str}  "
+                f"liq=${(b.get('liquidity') or 0):,.0f}"
+            )
+
+    return f"""ELIMINATION SIGNAL — {name.upper()} ({obs['icao']})
+Date: {today} (local)
+Observation time: {obs_time} UTC
+
+HF TEMPERATURE:
+  Current reading: {temp_f}°F ({obs.get('temp_c', '?')}°C)
+  Confirmation window (N={CONFIRM_N}): {' → '.join(f'{t:.1f}°F' for t in window)}
+  All readings above bucket upper: YES
+
+TARGET BUCKET:
+  Label: {alert['label']}
+  Direction: {alert['direction']}
+  Bucket upper bound: {upper}°F (wu_round half-up)
+  Margin above upper: {margin}°F
+  Celsius equivalent of current temp: {obs.get('temp_c', '?')}°C
+
+MARKET DATA:
+  NO buy price: {alert['no_price']*100:.1f}c
+  Edge (1 - NO price): {alert['edge_pct']:.1f}%
+  Liquidity: ${(alert['liquidity'] or 0):,.0f}
+
+FULL BUCKET LADDER:
+{chr(10).join(bucket_context)}
+
+KEY QUESTION: Is {temp_f}°F reliably above {upper}°F, or could sensor rounding /
+C→F conversion / METAR QC revise the daily max back into this bucket?
+"""
+
+
+def _call_llm_gate(prompt: str) -> dict | None:
+    """Call LLM for elimination gate decision. Anthropic primary, Groq fallback."""
+    if ANTHROPIC_API_KEY:
+        return _call_anthropic_gate(prompt)
+    if GROQ_API_KEY:
+        return _call_groq_gate(prompt)
+    logger.debug("No LLM API key — auto-approving elimination")
+    return None  # no key = skip gate, auto-approve
+
+
+def _call_anthropic_gate(prompt: str) -> dict | None:
+    try:
+        resp = httpx.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": LLM_MODEL_ANTHROPIC,
+                "max_tokens": 400,
+                "system": _ELIM_SYSTEM_PROMPT,
+                "messages": [{"role": "user", "content": prompt
+                              + "\n\nRespond ONLY with the JSON object, no markdown fences."}],
+            },
+            timeout=20.0,
+        )
+        resp.raise_for_status()
+        text_blocks = [b["text"] for b in resp.json().get("content", [])
+                       if b.get("type") == "text"]
+        raw = "".join(text_blocks).strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1]
+            if raw.endswith("```"):
+                raw = raw[:-3]
+        return json.loads(raw)
+    except Exception as e:
+        logger.warning(f"Anthropic gate call failed: {e}")
+        return None
+
+
+def _call_groq_gate(prompt: str) -> dict | None:
+    try:
+        resp = httpx.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": LLM_MODEL_GROQ,
+                "temperature": 0.1,
+                "max_tokens": 400,
+                "messages": [
+                    {"role": "system", "content": _ELIM_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                "response_format": {"type": "json_object"},
+            },
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        content = (((resp.json().get("choices") or [{}])[0])
+                   .get("message") or {}).get("content", "")
+        return json.loads(content)
+    except Exception as e:
+        logger.warning(f"Groq gate call failed: {e}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +555,11 @@ def _send_telegram_alert(city: str, temp: float, obs: dict, alerts: list,
         )
         if a.get("slug"):
             lines.append(f"  polymarket.com/market/{a['slug']}")
+        # LLM reasoning
+        llm_r = a.get("llm_reasoning")
+        llm_c = a.get("llm_confidence")
+        if llm_r:
+            lines.append(f"  LLM [{llm_c}]: {llm_r}")
 
     lines.append(
         f"\n<i>{CONFIRM_N}x HF > bucket upper (zero margin); "

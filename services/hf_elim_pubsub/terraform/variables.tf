@@ -81,3 +81,9 @@ variable "postpeak_elim_chat_id_secret" {
   type        = string
   default     = "POSTPEAK_ELIM_CHAT_ID"
 }
+
+variable "anthropic_api_key_secret" {
+  description = "Secret Manager secret name for ANTHROPIC_API_KEY (LLM gate)"
+  type        = string
+  default     = "ANTHROPIC_API_KEY"
+}
