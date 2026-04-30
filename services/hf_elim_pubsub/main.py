@@ -363,87 +363,123 @@ def process():
 # ---------------------------------------------------------------------------
 
 _ELIM_SYSTEM_PROMPT = """\
-You are an HF temperature elimination arbitrage analyst for Polymarket weather markets.
+You are a temperature elimination checker for Polymarket weather derivatives.
 
-You receive a CONFIRMED elimination signal: N consecutive high-frequency weather.gov
-readings show a US city's temperature has crossed above a Polymarket bucket's upper
-bound. The daily max CANNOT retreat — this is thermodynamic fact.
+You receive a signal: N consecutive 5-min weather.gov readings show a US city's
+temperature has crossed above a bucket's upper bound. Your ONLY job is to sanity-check
+the TEMPERATURE DATA. Is the temperature OBVIOUSLY and CLEARLY above the bucket?
 
-Your job: decide if buying NO on this bucket is a good trade RIGHT NOW.
+IMPORTANT CONTEXT:
+- METAR and weather.gov ALWAYS report in whole Celsius (e.g. 28°C, 29°C, 30°C).
+  This is NORMAL, not a red flag. Every single reading will be a whole Celsius number.
+- The Fahrenheit equivalents land at: ...82.4, 84.2, 86.0, 87.8, 89.6... (1.8°F steps)
+- These are the ONLY values you will ever see. Do NOT reject readings just because
+  they are at Celsius whole numbers — that is how ALL weather stations report.
 
-WHAT MAKES A GOOD ELIMINATION TRADE:
-- Temperature is WELL above the bucket upper (not borderline 0.1-0.3°F above)
-- Multiple consecutive readings confirm (not just barely N=2)
-- The NO price has real edge (buying at 85c for guaranteed $1 = 15c profit)
-- Sufficient liquidity to fill without walking the book
-- Settlement rounding won't reverse the elimination (watch C→F conversion artifacts:
-  e.g. 31.0°C = 87.8°F is only 0.3°F above 87.49 upper — METAR might report 87°F)
+YOUR DECISION FRAMEWORK — approve (BUY_NO) unless:
+1. The HF temp is the SAME Celsius value as the bucket upper when rounded.
+   Example: bucket upper 83.49°F, temp 84.2°F = 29°C. Settlement rounds 84.2 → 84.
+   This is ABOVE 83 — APPROVE.
+   Example: bucket upper 87.49°F, temp 87.8°F = 31°C. Settlement rounds 87.8 → 88.
+   BUT the official METAR max might report 87°F if station logged 30.6°C at peak.
+   Check the METAR readings provided — if METAR confirms ≥ the Celsius threshold, APPROVE.
+2. The temp and bucket are separated by LESS than one full Celsius step (1.8°F) AND
+   the METAR hourly observation does NOT confirm the crossing. This is the ONLY case
+   to SKIP — when HF 5-min shows a borderline crossing that METAR hasn't confirmed.
 
-RED FLAGS — reasons to SKIP:
-- Temperature is within 0.5°F of bucket upper (sensor rounding can flip settlement)
-- The readings are at Celsius whole-number boundaries (e.g. 29.0°C=84.2°F, 31.0°C=87.8°F)
-  because METAR reports Celsius and the C→F conversion creates false precision
-- NO price >= 95c with low liquidity (not worth the execution risk)
-- The observation time suggests prior-day residual heat (late evening local time)
+DO NOT consider liquidity, edge %, or NO price. Those are filtered elsewhere.
+DO NOT reject based on time of day.
+Your ONLY concern: is the temperature clearly above the bucket based on HF + METAR data?
+
+Default to BUY_NO. Only SKIP if genuinely ambiguous temperatures.
 
 Respond ONLY with valid JSON:
 {
   "action": "BUY_NO" | "SKIP",
   "confidence": "high" | "medium" | "low",
-  "reasoning": "<2-3 sentences>",
-  "risk_factors": ["<factor1>", "<factor2>"],
-  "margin_above_upper": "<how far temp is above bucket upper in °F>"
+  "reasoning": "<1-2 sentences, temperature-focused only>"
 }
 """
 
 
+def _fetch_recent_obs(icao: str, limit: int = 12) -> list[dict]:
+    """Fetch last N observations for LLM context (HF 5-min + METAR hourly)."""
+    try:
+        r = httpx.get(
+            f"https://api.weather.gov/stations/{icao}/observations",
+            params={"limit": limit},
+            headers={
+                "Accept": "application/geo+json",
+                "User-Agent": "PolyWeather-Elim/1.0",
+            },
+            timeout=8,
+        )
+        r.raise_for_status()
+        out = []
+        for feat in r.json().get("features") or []:
+            props = feat.get("properties") or {}
+            tc = (props.get("temperature") or {}).get("value")
+            ts = (props.get("timestamp") or "")[:19]
+            if tc is not None:
+                tc = float(tc)
+                out.append({
+                    "time": ts,
+                    "temp_c": tc,
+                    "temp_f": round(tc * 9 / 5 + 32, 2),
+                })
+        out.reverse()  # chronological order
+        return out
+    except Exception:
+        return []
+
+
 def _build_llm_context(city: str, today: str, temp_f: float, obs: dict,
                        alert: dict, window: list[float], all_buckets: list) -> str:
-    """Build the user prompt with all relevant context for LLM evaluation."""
+    """Build the user prompt with HF trend + METAR data for LLM evaluation."""
     info = CITY_REGISTRY.get(city, {})
     name = info.get("name", city)
+    icao = obs.get("icao", "?")
     obs_time = (obs.get("time") or "?")[:19]
     upper = alert["bucket_upper"]
     margin = round(temp_f - upper, 2)
 
-    # Nearby bucket context
-    bucket_context = []
-    for b in all_buckets:
-        bt = b.get("temp") or b.get("value")
-        no = b.get("no_buy")
-        if bt is not None:
-            no_str = f"NO={float(no)*100:.1f}c" if no is not None else "NO=n/a"
-            bucket_context.append(
-                f"  {b.get('label','?'):<10} {b.get('direction','exact'):<6} {no_str}  "
-                f"liq=${(b.get('liquidity') or 0):,.0f}"
-            )
+    # Fetch last 12 readings for trend context
+    recent = _fetch_recent_obs(icao, limit=12)
+    trend_lines = []
+    max_in_window = None
+    for r in recent:
+        marker = ""
+        if r["temp_f"] > upper:
+            marker = " > ABOVE bucket upper"
+        trend_lines.append(
+            f"  {r['time'][11:]}  {r['temp_c']:5.1f}°C = {r['temp_f']:5.1f}°F{marker}"
+        )
+        if max_in_window is None or r["temp_f"] > max_in_window:
+            max_in_window = r["temp_f"]
 
-    return f"""ELIMINATION SIGNAL — {name.upper()} ({obs['icao']})
+    max_c = round((max_in_window - 32) * 5 / 9, 1) if max_in_window else "?"
+
+    return f"""ELIMINATION CHECK — {name.upper()} ({icao})
 Date: {today} (local)
-Observation time: {obs_time} UTC
-
-HF TEMPERATURE:
-  Current reading: {temp_f}°F ({obs.get('temp_c', '?')}°C)
-  Confirmation window (N={CONFIRM_N}): {' → '.join(f'{t:.1f}°F' for t in window)}
-  All readings above bucket upper: YES
 
 TARGET BUCKET:
   Label: {alert['label']}
-  Direction: {alert['direction']}
-  Bucket upper bound: {upper}°F (wu_round half-up)
+  Bucket upper bound: {upper}°F
+  Current HF temp: {temp_f}°F ({obs.get('temp_c', '?')}°C)
   Margin above upper: {margin}°F
-  Celsius equivalent of current temp: {obs.get('temp_c', '?')}°C
+  N={CONFIRM_N} confirmation window: {' → '.join(f'{t:.1f}' for t in window)}°F
 
-MARKET DATA:
-  NO buy price: {alert['no_price']*100:.1f}c
-  Edge (1 - NO price): {alert['edge_pct']:.1f}%
-  Liquidity: ${(alert['liquidity'] or 0):,.0f}
+LAST 12 HF OBSERVATIONS (5-min cadence from weather.gov):
+{chr(10).join(trend_lines) if trend_lines else '  (unavailable)'}
 
-FULL BUCKET LADDER:
-{chr(10).join(bucket_context)}
+MAX IN THIS WINDOW: {max_in_window or '?'}°F ({max_c}°C)
 
-KEY QUESTION: Is {temp_f}°F reliably above {upper}°F, or could sensor rounding /
-C→F conversion / METAR QC revise the daily max back into this bucket?
+SETTLEMENT ROUNDING: wu_round (half-up) on Fahrenheit.
+  {temp_f}°F → settles as {round(temp_f + 0.5):.0f}°F (if this is the daily max)
+  Bucket {alert['label']} upper = {upper}°F → any max ≥ {upper + 0.01:.2f}°F exits this bucket.
+
+QUESTION: Based on the HF readings above, is the temperature CLEARLY above {upper}°F?
+Look at the trend — is it sustained or a single blip?
 """
 
 
